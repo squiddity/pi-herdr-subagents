@@ -209,7 +209,41 @@ subagent({ name: "Planner", agent: "planner", task: "Work through the design wit
 
 // Custom working directory
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
+
+// Hermetic extension set: no global/project/package discovery in the child
+subagent({
+  name: "Isolated worker",
+  task: "Run with only the requested runtime extensions",
+  extensionMode: "explicit",
+  extensions: "./tools/audit.ts,./tools/policy.ts",
+});
 ```
+
+### Extension loading
+
+`extensionMode: "normal"` preserves Pi's normal global, project, settings, and package extension discovery. Any paths in `extensions` are added with `-e`. `extensionMode: "explicit"` launches the child with `--no-extensions`, then explicitly loads:
+
+1. this currently-running subagents extension entrypoint;
+2. the mandatory `subagent-done.ts` child lifecycle extension; and
+3. the entries supplied through `extensions`.
+
+Relative caller paths are resolved to absolute paths once against the effective child `cwd`; duplicate entries are removed. `extensions` is comma-separated, so extension entry paths containing commas are not supported.
+
+The resolved mode and absolute caller-extension list are exported to Pi-backed children. Descendant Pi-backed `subagent` calls inherit each omitted field independently, while an explicit descendant value overrides that field. Use `extensions: ""` to clear an inherited caller-extension list. Claude-backed agents do not inherit this Pi runtime and reject calls that explicitly pass `extensionMode` or `extensions`.
+
+The complete runtime—including the exact source entrypoints for this extension and its child lifecycle bridge—is persisted beside the child session for optional resume continuity. Because that sidecar contains executable paths, `subagent_resume` never consumes it by default. Set `preserveExtensionRuntime: true` only after verifying that both the session and adjacent `.subagent-runtime.json` are trusted. Opted-in resume fails closed if the versioned metadata is missing or invalid.
+
+Explicit mode is useful when developing this package from source. Start the parent from the checkout, then descendants continue loading this exact source entrypoint without requiring an installed package:
+
+```bash
+pi -e ./pi-extension/subagents/index.ts
+```
+
+```typescript
+subagent({ name: "Source worker", task: "Test local changes", extensionMode: "explicit" });
+```
+
+> **Security:** Every explicitly loaded extension executes arbitrary code with the child's full OS permissions, and inherited entries execute again in every Pi-backed descendant. Absolute resolution prevents later cwd changes from retargeting a relative path, but it does not verify, sandbox, or pin the file's contents (including symlink targets). Only pass trusted extension entrypoints. Explicit mode suppresses ambient extension discovery; it does not sandbox the mandatory subagents extensions or caller-provided code.
 
 ### Parameters
 
@@ -226,6 +260,8 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| `extensionMode`        | `normal` \| `explicit` | `normal` or inherited | Keep normal Pi extension discovery, or disable discovery and load only the explicit child runtime. Pi-backed agents only. |
+| `extensions`           | string  | — or inherited | Comma-separated extension entry paths, resolved against the effective child cwd. An explicit value replaces the inherited caller list. |
 
 ---
 
@@ -259,6 +295,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `preserveExtensionRuntime` (optional): Load the exact executable extension runtime recorded beside the session. Defaults to `false`; enable only for a trusted session and sidecar.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`

@@ -1971,7 +1971,20 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_resume with an autoExit override", () => {
+  it("registers recursive extension loading parameters on subagent", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+
+    const modeSchema = subagentTool.parameters.properties.extensionMode;
+    assert.deepEqual(modeSchema.anyOf.map((entry: any) => entry.const), ["normal", "explicit"]);
+    assert.equal(subagentTool.parameters.properties.extensions.type, "string");
+    assert.match(subagentTool.parameters.properties.extensions.description, /effective child cwd/);
+  });
+
+  it("registers subagent_resume with lifecycle and explicit-runtime controls", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1981,6 +1994,11 @@ describe("tool registration", () => {
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
+
+    const preserveSchema = resumeTool.parameters.properties.preserveExtensionRuntime;
+    assert.equal(preserveSchema.type, "boolean");
+    assert.match(preserveSchema.description, /Default false/);
+    assert.match(preserveSchema.description, /trusted/);
   });
 });
 
