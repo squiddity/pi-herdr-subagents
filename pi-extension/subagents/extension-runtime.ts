@@ -74,19 +74,25 @@ export function assertExtensionRuntimeSupported(
   }
 }
 
-/** Build Pi CLI flags for the selected extension runtime. */
-export function buildPiExtensionArgs(
+/** Exact absolute extension entries passed with -e for a Pi child. */
+export function getPiExtensionEntries(
   runtime: ExtensionRuntime,
   paths: ExtensionRuntimeEntries,
 ): string[] {
   const entries = runtime.extensionMode === "explicit"
     ? [paths.subagentsEntry, paths.subagentDoneEntry, ...runtime.extensions]
     : [paths.subagentDoneEntry, ...runtime.extensions];
-  const uniqueEntries = [...new Set(entries.map((path) => resolve(path)))];
+  return [...new Set(entries.map((path) => resolve(path)))];
+}
 
+/** Build Pi CLI flags for the selected extension runtime. */
+export function buildPiExtensionArgs(
+  runtime: ExtensionRuntime,
+  paths: ExtensionRuntimeEntries,
+): string[] {
   return [
     ...(runtime.extensionMode === "explicit" ? ["--no-extensions"] : []),
-    ...uniqueEntries.flatMap((path) => ["-e", path]),
+    ...getPiExtensionEntries(runtime, paths).flatMap((path) => ["-e", path]),
   ];
 }
 

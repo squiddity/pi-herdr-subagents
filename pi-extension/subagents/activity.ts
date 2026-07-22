@@ -1,11 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { readBoundedRegularFile, UnsafeFileError } from "./safe-file.ts";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
 export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
 
 export type SubagentActivityEvent =
   | "session_start"
+  | "tool_telemetry"
   | "input"
   | "before_agent_start"
   | "agent_start"
@@ -45,6 +47,10 @@ export interface SubagentActivityState {
   toolName?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
+  /** Active callable tool names captured after child session startup handlers. */
+  actualTools?: string[];
+  /** Policy deny names exported by the host for this child. */
+  deniedTools?: string[];
 }
 
 export type ActivityReadResult =
@@ -54,7 +60,8 @@ export type ActivityReadResult =
 export type SubagentShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 export interface SubagentActivityRecorder {
-  sessionStart(): void;
+  sessionStart(actualTools?: string[], deniedTools?: string[]): void;
+  toolTelemetry(actualTools: string[], deniedTools: string[]): void;
   input(): void;
   beforeAgentStart(): void;
   agentStart(): void;
@@ -81,6 +88,7 @@ const KNOWN_PHASES = new Set<SubagentActivityPhase>(["starting", "active", "wait
 const KNOWN_SCOPES = new Set<SubagentActivityScope>(["agent", "turn", "provider", "streaming", "tool"]);
 const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_start",
+  "tool_telemetry",
   "input",
   "before_agent_start",
   "agent_start",
@@ -100,6 +108,8 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
+const MAX_ACTIVITY_TOOL_NAMES = 256;
+export const MAX_ACTIVITY_FILE_BYTES = 128 * 1024;
 
 export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
   return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
@@ -138,6 +148,41 @@ function validateOptionalActivityString(object: Record<string, unknown>, fieldNa
   if (typeof value !== "string") return `${fieldName} must be a string when present`;
   if (/\r|\n/.test(value)) return `${fieldName} must not contain newlines`;
   return value.length <= MAX_ACTIVITY_STRING_LENGTH ? null : `${fieldName} is too long`;
+}
+
+function validateOptionalToolNames(object: Record<string, unknown>, fieldName: string): string | null {
+  const value = object[fieldName];
+  if (value == null) return null;
+  if (!Array.isArray(value)) return `${fieldName} must be an array when present`;
+  if (value.length > MAX_ACTIVITY_TOOL_NAMES) return `${fieldName} has too many entries`;
+  const names = new Set<string>();
+  for (const entry of value) {
+    if (
+      typeof entry !== "string" ||
+      entry.length === 0 ||
+      entry.length > MAX_ACTIVITY_STRING_LENGTH ||
+      /\s|,|\r|\n/.test(entry)
+    ) return `${fieldName} contains an invalid tool name`;
+    if (names.has(entry)) return `${fieldName} contains duplicate tool names`;
+    names.add(entry);
+  }
+  return null;
+}
+
+function normalizeToolNames(values: string[] | undefined): string[] | undefined {
+  if (!values) return undefined;
+  const names = new Set<string>();
+  for (const value of values) {
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      value.length > MAX_ACTIVITY_STRING_LENGTH ||
+      /\s|,|\r|\n/.test(value)
+    ) return undefined;
+    names.add(value);
+    if (names.size > MAX_ACTIVITY_TOOL_NAMES) return undefined;
+  }
+  return [...names].sort();
 }
 
 function invalidActivity(error: string): ActivityReadResult {
@@ -179,6 +224,8 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
+    validateOptionalToolNames(object, "actualTools"),
+    validateOptionalToolNames(object, "deniedTools"),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
@@ -189,12 +236,14 @@ export function readSubagentActivityFile(
   activityFile: string,
   expectedRunningChildId: string,
 ): ActivityReadResult {
-  if (!existsSync(activityFile)) return { ok: false, reason: "missing" };
-
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(activityFile, "utf8"));
+    const raw = readBoundedRegularFile(activityFile, MAX_ACTIVITY_FILE_BYTES, "subagent activity");
+    parsed = JSON.parse(raw);
   } catch (error) {
+    if (error instanceof UnsafeFileError && error.code === "missing") {
+      return { ok: false, reason: "missing" };
+    }
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, reason: "invalid", error: message };
   }
@@ -208,7 +257,11 @@ export function writeSubagentActivityFile(activityFile: string, activity: Subage
   const tempFile = join(dir, `${activity.runningChildId}.json.${process.pid}.${activity.sequence}.tmp`);
 
   try {
-    writeFileSync(tempFile, `${JSON.stringify(activity)}\n`, "utf8");
+    const serialized = `${JSON.stringify(activity)}\n`;
+    if (Buffer.byteLength(serialized, "utf8") > MAX_ACTIVITY_FILE_BYTES) {
+      throw new Error(`serialized activity exceeds the ${MAX_ACTIVITY_FILE_BYTES}-byte limit`);
+    }
+    writeFileSync(tempFile, serialized, "utf8");
     renameSync(tempFile, activityFile);
   } catch (error) {
     try {
@@ -224,6 +277,7 @@ export function writeSubagentActivityFile(activityFile: string, activity: Subage
 function createNoopRecorder(): SubagentActivityRecorder {
   return {
     sessionStart() {},
+    toolTelemetry() {},
     input() {},
     beforeAgentStart() {},
     agentStart() {},
@@ -387,11 +441,25 @@ export function createSubagentActivityRecorder(params: {
   }
 
   return {
-    sessionStart() {
+    sessionStart(actualTools, deniedTools) {
       record("session_start", (current) => {
         current.phase = "starting";
         clearActiveState(current);
         delete current.waitingSince;
+        const normalizedActual = normalizeToolNames(actualTools);
+        const normalizedDenied = normalizeToolNames(deniedTools);
+        if (normalizedActual) current.actualTools = normalizedActual;
+        if (normalizedDenied) current.deniedTools = normalizedDenied;
+      }, "immediate");
+    },
+    toolTelemetry(actualTools, deniedTools) {
+      record("tool_telemetry", (current) => {
+        const normalizedActual = normalizeToolNames(actualTools);
+        const normalizedDenied = normalizeToolNames(deniedTools);
+        if (normalizedActual) current.actualTools = normalizedActual;
+        else delete current.actualTools;
+        if (normalizedDenied) current.deniedTools = normalizedDenied;
+        else delete current.deniedTools;
       }, "immediate");
     },
     input() {

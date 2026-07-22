@@ -17,7 +17,14 @@ export interface MessageEntry extends SessionEntry {
   };
 }
 
-export type SeededSubagentSessionMode = "lineage-only" | "fork";
+export type SeededSubagentSessionMode = "standalone" | "lineage-only" | "fork";
+
+export interface SeededProfileAttestation {
+  version: 1;
+  nonce: string;
+  signature: string;
+  customType: string;
+}
 
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
@@ -47,21 +54,45 @@ function getForkContentLines(parentSessionFile: string): string[] {
 
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
-  parentSessionFile: string;
+  parentSessionFile?: string;
   childSessionFile: string;
   childCwd: string;
+  profileAttestation?: SeededProfileAttestation;
 }): void {
+  if (params.mode !== "standalone" && !params.parentSessionFile) {
+    throw new Error(`${params.mode} session seeding requires a parent session file`);
+  }
+  const timestamp = new Date().toISOString();
   const header = {
     type: "session",
     version: 3,
     id: randomUUID(),
-    timestamp: new Date().toISOString(),
+    timestamp,
     cwd: params.childCwd,
-    parentSession: params.parentSessionFile,
+    ...(params.mode === "standalone" ? {} : { parentSession: params.parentSessionFile }),
   };
-  const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
-  const lines = [JSON.stringify(header), ...contentLines];
+  const attestationEntry = params.profileAttestation
+    ? JSON.stringify({
+        type: "custom",
+        id: randomUUID(),
+        parentId: null,
+        timestamp,
+        customType: params.profileAttestation.customType,
+        data: {
+          version: params.profileAttestation.version,
+          nonce: params.profileAttestation.nonce,
+          signature: params.profileAttestation.signature,
+        },
+      })
+    : null;
+  const contentLines = params.mode === "fork"
+    ? getForkContentLines(params.parentSessionFile!)
+    : [];
+  const lines = [
+    JSON.stringify(header),
+    ...(attestationEntry ? [attestationEntry] : []),
+    ...contentLines,
+  ];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
   writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");

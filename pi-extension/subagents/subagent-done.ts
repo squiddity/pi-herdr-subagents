@@ -8,6 +8,11 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  LAUNCH_PROFILE_VERSION,
+  parseLaunchProfileAttestation,
+  PROFILE_ATTESTATION_CUSTOM_TYPE,
+} from "./launch-profile.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -151,13 +156,22 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
 
-  // Show widget + status bar on session start
+  // Show widget + status bar on session start and persist the host-signed
+  // attestation outside model context. Active tools are captured later at
+  // before_agent_start, after Pi has awaited every extension's startup handler.
   pi.on("session_start", (_event, ctx) => {
-    recorder.sessionStart();
-    const tools = pi.getAllTools();
-    toolNames = tools.map((t) => t.name).sort();
-    denied = parseDeniedTools(deniedToolsValue);
+    const attestation = parseLaunchProfileAttestation(
+      process.env.PI_SUBAGENT_PROFILE_ATTESTATION,
+    );
+    if (attestation) {
+      ctx.sessionManager.appendCustomEntry(PROFILE_ATTESTATION_CUSTOM_TYPE, {
+        version: LAUNCH_PROFILE_VERSION,
+        ...attestation,
+      });
+    }
 
+    denied = parseDeniedTools(deniedToolsValue);
+    recorder.sessionStart();
     renderWidget(ctx, null);
   });
 
@@ -169,8 +183,11 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", (_event, ctx) => {
+    toolNames = pi.getActiveTools().slice().sort();
+    recorder.toolTelemetry(toolNames, denied);
     recorder.beforeAgentStart();
+    renderWidget(ctx, null);
   });
 
   pi.on("agent_start", () => {

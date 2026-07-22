@@ -241,7 +241,24 @@ pi -e ./pi-extension/subagents/index.ts
 subagent({ name: "Source worker", task: "Test local changes", extensionMode: "explicit" });
 ```
 
-> **Security:** Every explicitly loaded extension executes arbitrary code with the child's full OS permissions, and inherited entries execute again in every Pi-backed descendant. Absolute resolution prevents later cwd changes from retargeting a relative path, but it does not verify, sandbox, or pin the file's contents (including symlink targets). Only pass trusted extension entrypoints. Explicit mode suppresses ambient extension discovery; it does not sandbox the mandatory subagents extensions or caller-provided code.
+For a recursive memory-import-style workflow, load the importer once and leave the
+runtime fields omitted in descendants. The child receives absolute inherited entries,
+so each Pi-backed generation keeps the same explicit runtime:
+
+```typescript
+subagent({
+  name: "Memory importer",
+  task: "Import memories, then delegate validation to another worker",
+  extensionMode: "explicit",
+  extensions: "./tools/memory-import.ts",
+  autoExit: false,
+});
+
+// Inside that child: extensionMode and extensions inherit independently.
+subagent({ name: "Memory validator", task: "Validate the imported memories" });
+```
+
+> **Security boundary:** Every explicitly loaded extension executes arbitrary code with the child's full OS permissions, and inherited entries execute again in every Pi-backed descendant. Absolute resolution prevents later cwd changes from retargeting a relative path, but it does not verify, sandbox, or pin the file's contents (including symlink targets). Only pass trusted extension entrypoints. Explicit mode suppresses ambient **extension discovery only**. It does not restrict filesystem, process, or network access; disable all Pi config or project instructions; or sandbox the mandatory subagents extensions and caller-provided code.
 
 ### Parameters
 
@@ -294,6 +311,37 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+
+### Resume profile preservation
+
+Every initial Pi-backed launch writes `<session>.profile.json` beside the session.
+This bounded sidecar contains only the effective model, thinking level, cwd, named-agent
+key, exact `--tools` allowlist (including `caller_ping` and `subagent_done`, or `null`
+when no allowlist was supplied), deny names, absolute extension runtime entries/mode,
+inherited caller entries, config root, and a public host attestation. It never stores
+the task, system prompt, credentials, permission grants, or the private attestation key.
+
+The host signs every field together with the canonical absolute session path. At the
+child's first `session_start`, the public nonce/signature is also persisted as Pi custom
+session metadata outside model context. `subagent_resume` reapplies executable extension
+or config entries only when the sidecar signature and bound session metadata both match.
+A malformed, tampered, symlinked, non-regular, oversized, or externally fabricated
+sidecar fails closed before a pane is started. The named-agent key is restored so the
+recursive same-agent guard continues to work after resume.
+
+Older or external sessions with no profile can still resume, but use an isolated
+`--no-extensions` path that loads no extensions and accepts no sidecar extension/config
+entries. Results mark this path **isolated-unverified**; lifecycle-tool auto-exit and
+profile telemetry are unavailable on that path.
+Prefer `subagent_resume` over invoking `pi --session` directly, because a raw Pi resume
+bypasses host profile preservation, tracking, and completion telemetry.
+
+After all synchronous child startup handlers run, telemetry records the bounded names
+returned by `pi.getActiveTools()` plus the effective deny names. Completion requires
+both telemetry sets, compares expected and actual deny sets, removes denied names from
+the expected allowlist, and reports denied names that remain active. Evidence is
+**exact**, **mismatch**, **unrestricted** (no allowlist only after deny checks), or
+**unverified**.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`

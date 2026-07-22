@@ -1,6 +1,15 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -46,9 +55,10 @@ import {
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
+  MAX_ACTIVITY_FILE_BYTES,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
@@ -451,6 +461,31 @@ describe("session.ts", () => {
   });
 
   describe("seedSubagentSessionFile", () => {
+    it("puts host attestation metadata at the start of standalone sessions", () => {
+      const childFile = join(dir, "standalone-child.jsonl");
+      seedSubagentSessionFile({
+        mode: "standalone",
+        childSessionFile: childFile,
+        childCwd: "/tmp/standalone-child-cwd",
+        profileAttestation: {
+          version: 1,
+          customType: "pi-herdr-subagents.launch-profile-attestation",
+          nonce: "ab".repeat(32),
+          signature: "cd".repeat(32),
+        },
+      });
+
+      const entries = readFileSync(childFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.equal(entries.length, 2);
+      assert.equal(entries[0].type, "session");
+      assert.equal(entries[0].parentSession, undefined);
+      assert.equal(entries[1].type, "custom");
+      assert.equal(entries[1].data.nonce, "ab".repeat(32));
+    });
+
     it("creates a lineage-only child session with parent linkage and no copied turns", () => {
       const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
       const childFile = join(dir, "lineage-child.jsonl");
@@ -1391,6 +1426,47 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("captures active tools at before_agent_start after awaited startup handlers", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir }) => {
+      const activityFile = join(projectDir, "activity.json");
+      const previousId = process.env.PI_SUBAGENT_ID;
+      const previousActivity = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+      process.env.PI_SUBAGENT_ID = "telemetry-child";
+      process.env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+      let activeTools = ["read", "write"];
+      const handlers = new Map<string, Function[]>();
+      try {
+        subagentDoneExtension({
+          on(event: string, handler: Function) {
+            handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+          },
+          registerShortcut() {},
+          registerTool() {},
+          getActiveTools() {
+            return activeTools;
+          },
+        } as any);
+        const ctx = {
+          sessionManager: { appendCustomEntry() {} },
+          ui: { setWidget() {} },
+        };
+        // Pi awaits each session_start handler before invoking the next.
+        await handlers.get("session_start")?.[0]({}, ctx);
+        activeTools = ["read"];
+        await Promise.resolve();
+        await handlers.get("before_agent_start")?.[0]({}, ctx);
+
+        const result = readSubagentActivityFile(activityFile, "telemetry-child");
+        assert.ok(result.ok);
+        assert.deepEqual(result.activity.actualTools, ["read"]);
+        assert.deepEqual(result.activity.deniedTools, []);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_ID", previousId);
+        restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", previousActivity);
+      }
+    });
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1978,6 +2054,50 @@ describe("tool registration", () => {
     });
   });
 
+  it("canonicalizes relative resume paths before profile-controlled cwd changes", () => {
+    withTempDir((dir) => {
+      const previousCwd = process.cwd();
+      try {
+        process.chdir(dir);
+        const resolved = (subagentsModule as any).__test__.resolveResumeSessionPath("sessions/child.jsonl");
+        assert.equal(resolved, join(dir, "sessions", "child.jsonl"));
+      } finally {
+        process.chdir(previousCwd);
+      }
+    });
+  });
+
+  it("constructs external/legacy resumes with no ambient extension discovery", () => {
+    const args = (subagentsModule as any).__test__.buildIsolatedResumeArgs("/tmp/external.jsonl");
+    assert.deepEqual(args, [
+      "pi",
+      "--session",
+      "/tmp/external.jsonl",
+      "--no-extensions",
+    ]);
+  });
+
+  it("keeps the recursive same-agent guard effective for restored resume identity", async () => {
+    const previousAgent = process.env.PI_SUBAGENT_AGENT;
+    process.env.PI_SUBAGENT_AGENT = "reviewer";
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      const result = await subagentTool.execute(
+        "call",
+        { name: "Nested reviewer", task: "review", agent: "reviewer" },
+        undefined,
+        undefined,
+        {},
+      );
+      assert.equal(result.details.error, "self-spawn blocked");
+      assert.match(result.content[0].text, /do not start another reviewer/);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_AGENT", previousAgent);
+    }
+  });
+
   it("expands spawning false to deny subagent interruption", () => {
     const testApi = (subagentsModule as any).__test__;
     const denied = testApi.resolveDenyTools({ spawning: false });
@@ -2019,6 +2139,8 @@ describe("tool registration", () => {
     assert.deepEqual(modeSchema.anyOf.map((entry: any) => entry.const), ["normal", "explicit"]);
     assert.equal(subagentTool.parameters.properties.extensions.type, "string");
     assert.match(subagentTool.parameters.properties.extensions.description, /effective child cwd/);
+    assert.match(modeSchema.description, /ambient extension discovery/);
+    assert.match(modeSchema.description, /does not restrict OS access/);
 
     const autoExitSchema = subagentTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
@@ -2037,6 +2159,48 @@ describe("tool registration", () => {
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
 
+  });
+
+  it("rejects symlink and special resume session paths before terminal creation", async () => {
+    const dir = createTestDir();
+    try {
+      const target = createSessionFile(dir, []);
+      const symlinkPath = join(dir, "linked-session.jsonl");
+      symlinkSync(target, symlinkPath);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+
+      let result = await resumeTool.execute("call", { sessionPath: symlinkPath }, undefined, undefined, {});
+      assert.equal(result.details.error, "unsafe session path");
+      assert.match(result.content[0].text, /symbolic link/);
+
+      const fifoPath = join(dir, "fifo-session.jsonl");
+      execFileSync("mkfifo", [fifoPath]);
+      result = await resumeTool.execute("call", { sessionPath: fifoPath }, undefined, undefined, {});
+      assert.equal(result.details.error, "unsafe session path");
+      assert.match(result.content[0].text, /regular file/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails a malformed resume profile before checking or creating a terminal", async () => {
+    const dir = createTestDir();
+    try {
+      const sessionPath = createSessionFile(dir, []);
+      writeFileSync(`${sessionPath}.profile.json`, JSON.stringify({ version: 1, task: "must not load" }));
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+
+      const result = await resumeTool.execute("call", { sessionPath }, undefined, undefined, {});
+      assert.equal(result.details.error, "invalid launch profile");
+      assert.equal(result.details.profileStatus, "malformed");
+      assert.match(result.content[0].text, /Refusing to resume/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -2129,10 +2293,16 @@ describe("subagent activity snapshots", () => {
       });
 
       recorder.sessionStart();
+      recorder.toolTelemetry(
+        ["write", "read", "read"],
+        ["subagent_resume", "subagent"],
+      );
       recorder.toolExecutionStart("tool-1", "bash");
 
       const read = readSubagentActivityFile(activityFile, "child-1");
       assert.ok(read.ok);
+      assert.deepEqual(read.activity.actualTools, ["read", "write"]);
+      assert.deepEqual(read.activity.deniedTools, ["subagent", "subagent_resume"]);
       assert.equal(read.activity.phase, "active");
       assert.equal(read.activity.activeScope, "tool");
       assert.equal(read.activity.toolName, "bash");
@@ -2182,6 +2352,9 @@ describe("subagent activity snapshots", () => {
         { runningChildId: 42 },
         { toolActive: "yes" },
         { toolName: "bad\nname" },
+        { actualTools: "read" },
+        { actualTools: ["read", "read"] },
+        { deniedTools: ["bad tool"] },
       ];
 
       for (const [index, overrides] of cases.entries()) {
@@ -2193,6 +2366,37 @@ describe("subagent activity snapshots", () => {
         assert.equal(read.ok, false);
         assert.equal((read as { ok: false; reason: string }).reason, "invalid");
       }
+    });
+  });
+
+  it("rejects symlink, FIFO, directory, and oversized activity files without blocking", () => {
+    withTempDir((dir) => {
+      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+      const activityFile = getSubagentActivityFile(dir, "special");
+      const target = join(dir, "target-activity.json");
+      writeFileSync(target, "{}\n");
+      symlinkSync(target, activityFile);
+      let read = readSubagentActivityFile(activityFile, "special");
+      assert.equal(read.ok, false);
+      assert.match((read as { ok: false; error?: string }).error ?? "", /symbolic link/);
+      rmSync(activityFile);
+
+      mkdirSync(activityFile);
+      read = readSubagentActivityFile(activityFile, "special");
+      assert.equal(read.ok, false);
+      assert.match((read as { ok: false; error?: string }).error ?? "", /regular file/);
+      rmSync(activityFile, { recursive: true });
+
+      execFileSync("mkfifo", [activityFile]);
+      read = readSubagentActivityFile(activityFile, "special");
+      assert.equal(read.ok, false);
+      assert.match((read as { ok: false; error?: string }).error ?? "", /regular file/);
+      rmSync(activityFile);
+
+      writeFileSync(activityFile, Buffer.alloc(MAX_ACTIVITY_FILE_BYTES + 1, 0x20));
+      read = readSubagentActivityFile(activityFile, "special");
+      assert.equal(read.ok, false);
+      assert.match((read as { ok: false; error?: string }).error ?? "", /byte limit/);
     });
   });
 
@@ -2558,7 +2762,7 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
-    assert.match(presentation, /Resume: pi --session/);
+    assert.match(presentation, /Resume: subagent_resume/);
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {
@@ -2583,7 +2787,7 @@ describe("subagent interruption", () => {
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
     assert.match(presentation, /subagent_resume/);
-    assert.match(presentation, /Resume: pi --session/);
+    assert.match(presentation, /Resume: subagent_resume/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
 });
