@@ -231,8 +231,6 @@ Relative caller paths are resolved to absolute paths once against the effective 
 
 The resolved mode and absolute caller-extension list are exported to Pi-backed children. Descendant Pi-backed `subagent` calls inherit each omitted field independently, while an explicit descendant value overrides that field. Use `extensions: ""` to clear an inherited caller-extension list. Claude-backed agents do not inherit this Pi runtime and reject calls that explicitly pass `extensionMode` or `extensions`.
 
-The complete runtime—including the exact source entrypoints for this extension and its child lifecycle bridge—is persisted beside the child session for optional resume continuity. Because that sidecar contains executable paths, `subagent_resume` never consumes it by default. Set `preserveExtensionRuntime: true` only after verifying that both the session and adjacent `.subagent-runtime.json` are trusted. Opted-in resume fails closed if the versioned metadata is missing or invalid.
-
 Explicit mode is useful when developing this package from source. Start the parent from the checkout, then descendants continue loading this exact source entrypoint without requiring an installed package:
 
 ```bash
@@ -253,7 +251,8 @@ subagent({ name: "Source worker", task: "Test local changes", extensionMode: "ex
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
-| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
+| `autoExit`             | boolean | agent setting or `true` for bare spawns | Override automatic exit after the first completed turn. Set `false` for Pi-backed recursive orchestrators that must receive child results before calling `subagent_done`. Claude-backed spawns reject this override. |
+| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of effective `autoExit`. |
 | `model`                | string  | configured or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | parent level   | Pi thinking level (`off` through `max`); omit to inherit the parent                                |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
@@ -295,7 +294,6 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
-- `preserveExtensionRuntime` (optional): Load the exact executable extension runtime recorded beside the session. Defaults to `false`; enable only for a trusted session and sidecar.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
@@ -431,6 +429,16 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 name: scout
 auto-exit: true
 ---
+```
+
+The `subagent` tool's `autoExit` parameter overrides frontmatter for one Pi-backed spawn. Claude-backed spawns reject this parameter because their stop hook does not support deferred completion. Recursive Pi orchestrators should remain open while descendants run, then call `subagent_done` only after processing their results:
+
+```typescript
+subagent({
+  name: "Recursive orchestrator",
+  autoExit: false,
+  task: "Spawn a child, process its delivered result, then call subagent_done.",
+});
 ```
 
 ### `interactive`

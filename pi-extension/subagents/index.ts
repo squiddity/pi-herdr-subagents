@@ -41,9 +41,6 @@ import {
   buildPiExtensionArgs,
   getExtensionRuntimeEnv,
   resolveExtensionRuntime,
-  resolveResumeExtensionRuntime,
-  writeExtensionRuntimeSidecar,
-  type ExtensionRuntime,
 } from "./extension-runtime.ts";
 
 import {
@@ -179,6 +176,12 @@ const SubagentParams = Type.Object({
     Type.Boolean({
       description:
         "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+    }),
+  ),
+  autoExit: Type.Optional(
+    Type.Boolean({
+      description:
+        "Whether this subagent exits automatically after its first completed turn. Set false for recursive orchestrators that must remain alive to receive child results and call subagent_done afterward. Overrides agent frontmatter.",
     }),
   ),
   interactive: Type.Optional(
@@ -403,7 +406,7 @@ function resolveLaunchBehavior(
  * Resolution order:
  *   1. Explicit `interactive` tool parameter wins.
  *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
+ *   3. Default: the inverse of the effective `auto-exit` value. Agents that auto-exit are
  *      autonomous (scout, worker, reviewer) and the parent session should be
  *      woken on stall/recovery transitions. Agents that don't auto-exit are
  *      driven by the user in their own pane (planner, iterate/fork) and
@@ -417,8 +420,12 @@ function resolveEffectiveAutoExit(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  // Named agents preserve their declared behavior. Bare tool calls are
-  // autonomous by default, including full-context forks: `fork` controls
+  // A per-spawn override supports recursive orchestrators that need to finish
+  // one turn, receive descendant steer messages, and call subagent_done later.
+  if (params.autoExit != null) return params.autoExit;
+
+  // Named agents otherwise preserve their declared behavior. Bare tool calls
+  // are autonomous by default, including full-context forks: `fork` controls
   // context inheritance, not whether the child should remain open. Interactive
   // flows such as /iterate opt out explicitly with `interactive: true`.
   if (agentDefs) return agentDefs.autoExit ?? false;
@@ -456,11 +463,6 @@ function formatElapsed(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}m ${s}s`;
-}
-
-function extensionRuntimeResumeHint(runtime: ExtensionRuntime | undefined): string {
-  if (!runtime || (runtime.extensionMode === "normal" && runtime.extensions.length === 0)) return "";
-  return "\nTo reuse this session's executable extension runtime, call subagent_resume with preserveExtensionRuntime: true after verifying that the session and its adjacent runtime metadata are trusted.";
 }
 
 /**
@@ -587,8 +589,6 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
-  /** Resolved extension loading settings propagated to Pi-backed descendants. */
-  extensionRuntime?: ExtensionRuntime;
 }
 
 interface SubagentRuntime {
@@ -1087,6 +1087,17 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+function assertAutoExitOverrideSupported(
+  backend: "pi" | "claude",
+  autoExit: boolean | undefined,
+): void {
+  if (backend === "claude" && autoExit !== undefined) {
+    throw new Error(
+      "autoExit overrides are supported only for Pi-backed subagents; omit autoExit or use a Pi-backed agent.",
+    );
+  }
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1106,6 +1117,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  assertAutoExitOverrideSupported,
   runningSubagents,
   formatElapsed,
 };
@@ -1171,6 +1183,7 @@ async function launchSubagent(
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
   const childBackend = agentDefs?.cli === "claude" ? "claude" : "pi";
+  assertAutoExitOverrideSupported(childBackend, params.autoExit);
   assertExtensionRuntimeSupported(childBackend, params);
   const extensionRuntime = childBackend === "pi"
     ? resolveExtensionRuntime(params, targetCwdForSession)
@@ -1318,7 +1331,6 @@ async function launchSubagent(
   for (const arg of buildPiExtensionArgs(extensionRuntime, CURRENT_EXTENSION_ENTRIES)) {
     parts.push(arg.startsWith("-") ? arg : shellQuote(arg));
   }
-  writeExtensionRuntimeSidecar(subagentSessionFile, extensionRuntime, CURRENT_EXTENSION_ENTRIES);
 
   if (effectiveModel) {
     parts.push("--model", shellQuote(effectiveModel));
@@ -1445,7 +1457,6 @@ async function launchSubagent(
     activityFile,
     interactive: effectiveInteractive,
     runtimePlan,
-    extensionRuntime,
     lifecycle: createLifecycle(startTime),
   };
 
@@ -1776,7 +1787,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}${extensionRuntimeResumeHint(running.extensionRuntime)}`;
+              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
               completionApi.sendMessage(
                 {
                   customType: "subagent_ping",
@@ -1787,7 +1798,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                     message: result.ping.message,
                     agent: running.agent,
                     sessionFile: result.sessionFile,
-                    extensionRuntime: running.extensionRuntime,
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
@@ -1815,7 +1825,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
-                  ...(running.extensionRuntime ? { extensionRuntime: running.extensionRuntime } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -1864,7 +1873,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             model: running.runtimePlan?.model,
             thinking: running.runtimePlan?.thinking,
             runtimePlan: running.runtimePlan,
-            extensionRuntime: running.extensionRuntime,
             status: "started",
           },
         };
@@ -2072,12 +2080,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
           }),
         ),
-        preserveExtensionRuntime: Type.Optional(
-          Type.Boolean({
-            description:
-              "Opt in to loading executable extension paths from the session's adjacent runtime sidecar. Default false. Enable only after verifying that the session and sidecar are trusted.",
-          }),
-        ),
       }),
 
       renderCall(args, theme) {
@@ -2128,33 +2130,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Sidecars contain executable extension paths and are therefore never
-        // trusted implicitly for a caller-supplied session. Explicit opt-in also
-        // preserves the exact source entrypoints used by the original launch.
-        const resumeExtensionRuntime = resolveResumeExtensionRuntime({
-          sessionPath: params.sessionPath,
-          preserveExtensionRuntime: params.preserveExtensionRuntime === true,
-          fallback: {
-            runtime: resolveExtensionRuntime({}, ctx.cwd),
-            entries: CURRENT_EXTENSION_ENTRIES,
-          },
-        });
-        const extensionRuntime = resumeExtensionRuntime.runtime;
-        const extensionEntries = resumeExtensionRuntime.entries;
-
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSubagentPane(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build pi resume command with the same extension runtime as the
-        // original child, including explicit-mode discovery suppression.
+        // Build pi resume command
         const parts = ["pi", "--session", shellQuote(params.sessionPath)];
-        for (const arg of buildPiExtensionArgs(extensionRuntime, extensionEntries)) {
-          parts.push(arg.startsWith("-") ? arg : shellQuote(arg));
-        }
-        writeExtensionRuntimeSidecar(params.sessionPath, extensionRuntime, extensionEntries);
+
+        // Load subagent-done extension so the agent can self-terminate if needed
+        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+        parts.push("-e", shellQuote(subagentDonePath));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -2183,9 +2170,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const resumeEnvParts: string[] = [];
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
-        }
-        for (const [envName, value] of Object.entries(getExtensionRuntimeEnv(extensionRuntime))) {
-          resumeEnvParts.push(`${envName}=${shellQuote(value)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
@@ -2230,7 +2214,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           activityFile,
           interactive,
           runtimePlan: undefined,
-          extensionRuntime,
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);
@@ -2255,7 +2238,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}${extensionRuntimeResumeHint(extensionRuntime)}`;
+              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
               completionApi.sendMessage(
                 {
                   customType: "subagent_ping",
@@ -2265,7 +2248,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                     name: result.ping.name,
                     message: result.ping.message,
                     sessionFile: params.sessionPath,
-                    extensionRuntime,
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
@@ -2301,7 +2283,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: params.sessionPath,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
-                  extensionRuntime,
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2335,7 +2316,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name,
             sessionPath: params.sessionPath,
             launchScriptFile,
-            extensionRuntime,
             status: "started",
           },
         };

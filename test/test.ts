@@ -1043,6 +1043,30 @@ describe("subagent discovery", () => {
       false,
     );
 
+    // A per-spawn override wins over named-agent frontmatter so recursive
+    // orchestrators can remain alive until descendant results arrive.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit(
+        { name: "A", task: "T", autoExit: false },
+        { autoExit: true },
+      ),
+      false,
+    );
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T", autoExit: false },
+        { autoExit: true },
+      ),
+      true,
+    );
+    assert.equal(
+      testApi.resolveEffectiveAutoExit(
+        { name: "A", task: "T", autoExit: true },
+        { autoExit: false },
+      ),
+      true,
+    );
+
     // Named agents without auto-exit preserve their interactive behavior.
     assert.equal(
       testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, { autoExit: false }),
@@ -1083,6 +1107,19 @@ describe("subagent discovery", () => {
         null,
       ),
       true,
+    );
+  });
+
+  it("rejects per-spawn autoExit overrides for Claude-backed agents", () => {
+    assert.doesNotThrow(() => testApi.assertAutoExitOverrideSupported("pi", false));
+    assert.doesNotThrow(() => testApi.assertAutoExitOverrideSupported("claude", undefined));
+    assert.throws(
+      () => testApi.assertAutoExitOverrideSupported("claude", false),
+      /supported only for Pi-backed subagents/,
+    );
+    assert.throws(
+      () => testApi.assertAutoExitOverrideSupported("claude", true),
+      /supported only for Pi-backed subagents/,
     );
   });
 
@@ -1971,7 +2008,7 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers recursive extension loading parameters on subagent", () => {
+  it("registers recursive runtime and lifecycle parameters on subagent", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1982,9 +2019,14 @@ describe("tool registration", () => {
     assert.deepEqual(modeSchema.anyOf.map((entry: any) => entry.const), ["normal", "explicit"]);
     assert.equal(subagentTool.parameters.properties.extensions.type, "string");
     assert.match(subagentTool.parameters.properties.extensions.description, /effective child cwd/);
+
+    const autoExitSchema = subagentTool.parameters.properties.autoExit;
+    assert.equal(autoExitSchema.type, "boolean");
+    assert.match(autoExitSchema.description, /recursive orchestrators/);
+    assert.match(autoExitSchema.description, /Overrides agent frontmatter/);
   });
 
-  it("registers subagent_resume with lifecycle and explicit-runtime controls", () => {
+  it("registers subagent_resume with lifecycle controls", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1995,10 +2037,6 @@ describe("tool registration", () => {
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
 
-    const preserveSchema = resumeTool.parameters.properties.preserveExtensionRuntime;
-    assert.equal(preserveSchema.type, "boolean");
-    assert.match(preserveSchema.description, /Default false/);
-    assert.match(preserveSchema.description, /trusted/);
   });
 });
 

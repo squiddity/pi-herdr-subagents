@@ -1,5 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { resolve } from "node:path";
 
 export type ExtensionMode = "normal" | "explicit";
 
@@ -19,14 +18,8 @@ export interface ExtensionRuntimeEntries {
   subagentDoneEntry: string;
 }
 
-export interface PersistedExtensionRuntime {
-  runtime: ExtensionRuntime;
-  entries: ExtensionRuntimeEntries;
-}
-
 export const EXTENSION_MODE_ENV = "PI_SUBAGENT_EXTENSION_MODE";
 export const EXTENSIONS_ENV = "PI_SUBAGENT_EXTENSIONS";
-const EXTENSION_RUNTIME_SIDECAR_SUFFIX = ".subagent-runtime.json";
 
 function parseMode(value: string | undefined): ExtensionMode {
   if (value == null || value === "") return "normal";
@@ -103,74 +96,4 @@ export function getExtensionRuntimeEnv(runtime: ExtensionRuntime): Record<string
     [EXTENSION_MODE_ENV]: runtime.extensionMode,
     [EXTENSIONS_ENV]: runtime.extensions.join(","),
   };
-}
-
-export function getExtensionRuntimeSidecarPath(sessionPath: string): string {
-  return `${sessionPath}${EXTENSION_RUNTIME_SIDECAR_SUFFIX}`;
-}
-
-/**
- * Persist the complete launch identity for an explicitly opted-in resume.
- * The sidecar is metadata, not a trust boundary: callers must never consume it
- * without an explicit user/model opt-in because it contains executable paths.
- */
-export function writeExtensionRuntimeSidecar(
-  sessionPath: string,
-  runtime: ExtensionRuntime,
-  entries: ExtensionRuntimeEntries,
-): void {
-  writeFileSync(
-    getExtensionRuntimeSidecarPath(sessionPath),
-    `${JSON.stringify({ version: 2, runtime, entries }, null, 2)}\n`,
-    "utf8",
-  );
-}
-
-export function readExtensionRuntimeSidecar(sessionPath: string): PersistedExtensionRuntime | null {
-  try {
-    const value = JSON.parse(readFileSync(getExtensionRuntimeSidecarPath(sessionPath), "utf8"));
-    if (
-      value?.version !== 2 ||
-      (value.runtime?.extensionMode !== "normal" && value.runtime?.extensionMode !== "explicit") ||
-      !Array.isArray(value.runtime?.extensions) ||
-      !value.runtime.extensions.every((path: unknown) => typeof path === "string" && isAbsolute(path)) ||
-      typeof value.entries?.subagentsEntry !== "string" ||
-      !isAbsolute(value.entries.subagentsEntry) ||
-      typeof value.entries?.subagentDoneEntry !== "string" ||
-      !isAbsolute(value.entries.subagentDoneEntry)
-    ) {
-      return null;
-    }
-    return {
-      runtime: {
-        extensionMode: value.runtime.extensionMode,
-        extensions: [...new Set(value.runtime.extensions)],
-      },
-      entries: {
-        subagentsEntry: value.entries.subagentsEntry,
-        subagentDoneEntry: value.entries.subagentDoneEntry,
-      },
-    };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Select resume settings without implicitly trusting executable paths adjacent
- * to an arbitrary caller-supplied session file.
- */
-export function resolveResumeExtensionRuntime(options: {
-  sessionPath: string;
-  preserveExtensionRuntime: boolean;
-  fallback: PersistedExtensionRuntime;
-}): PersistedExtensionRuntime {
-  if (!options.preserveExtensionRuntime) return options.fallback;
-  const persisted = readExtensionRuntimeSidecar(options.sessionPath);
-  if (!persisted) {
-    throw new Error(
-      `Cannot preserve extension runtime: no valid version-2 runtime sidecar exists for ${options.sessionPath}.`,
-    );
-  }
-  return persisted;
 }
