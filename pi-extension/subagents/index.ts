@@ -152,7 +152,7 @@ const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
+        "Exact named-profile key to load defaults from. Copy a profile key supplied by the caller; display names never select profiles. Supplied unknown keys fail before launch.",
     }),
   ),
   systemPrompt: Type.Optional(
@@ -231,6 +231,8 @@ interface AgentDefaults {
   cwd?: string;
   cli?: string;
   body?: string;
+  /** Exact named profiles this profile may launch; undefined means unrestricted. */
+  allowedChildAgents?: string[];
   disableModelInvocation?: boolean;
 }
 
@@ -306,6 +308,15 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
   return undefined;
 }
 
+function parseAllowedChildAgents(frontmatter: string): string[] | undefined {
+  const match = frontmatter.match(/^allowed-child-agents:\s*(.*)$/m);
+  if (!match) return undefined;
+  return match[1]!
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
@@ -335,6 +346,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
     body: body || undefined,
+    allowedChildAgents: parseAllowedChildAgents(frontmatter),
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
   };
@@ -486,6 +498,34 @@ function resolveExplicitAgentDefaults(agentName: string): AgentDefaults {
     throw new Error(`Unknown named subagent profile "${agentName}"`);
   }
   return agentDefs;
+}
+
+function readAllowedChildAgents(): string[] | null | undefined {
+  const raw = process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS;
+  if (raw === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null) return null;
+    if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== "string" || value.length === 0)) {
+      return [];
+    }
+    return [...new Set(parsed)];
+  } catch {
+    // A malformed host-provided policy must fail closed rather than broaden
+    // the child launch surface.
+    return [];
+  }
+}
+
+function assertAllowedChildAgent(agentName: string | undefined): void {
+  const allowed = readAllowedChildAgents();
+  if (allowed == null) return;
+  if (agentName === undefined) {
+    throw new Error("This named subagent profile requires an explicit allowed child profile");
+  }
+  if (!allowed.includes(agentName)) {
+    throw new Error(`Child profile "${agentName}" is not allowed by the active parent profile`);
+  }
 }
 
 function formatElapsed(seconds: number): string {
@@ -1169,6 +1209,8 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   resolveExplicitAgentDefaults,
+  readAllowedChildAgents,
+  assertAllowedChildAgent,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -1224,6 +1266,7 @@ async function launchSubagent(
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
+  assertAllowedChildAgent(params.agent);
   const agentDefs = params.agent !== undefined
     ? resolveExplicitAgentDefaults(params.agent)
     : null;
@@ -1289,6 +1332,7 @@ async function launchSubagent(
       extensionEntries: getPiExtensionEntries(extensionRuntime, CURRENT_EXTENSION_ENTRIES),
       inheritedExtensionEntries: [...extensionRuntime.extensions],
       configRoot: effectiveConfigRoot,
+      allowedChildAgents: agentDefs?.allowedChildAgents ?? null,
     };
     // A host-only HMAC binds every executable/config field to this exact
     // session path. The public attestation is also written into child session
@@ -1490,6 +1534,7 @@ async function launchSubagent(
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
   envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent ?? "")}`);
+  envParts.push(`PI_SUBAGENT_ALLOWED_CHILD_AGENTS=${shellQuote(JSON.stringify(agentDefs?.allowedChildAgents ?? null))}`);
   envParts.push(`PI_SUBAGENT_AUTO_EXIT=${shellQuote(effectiveAutoExit ? "1" : "")}`);
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);

@@ -1014,6 +1014,56 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("parses an exact child-profile allowlist, including an explicit empty policy", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "allowlist-test-agent",
+        [
+          "name: allowlist-test-agent",
+          "allowed-child-agents: mem-import-extractor, mem-import-proposer",
+        ].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "empty-allowlist-test-agent",
+        [
+          "name: empty-allowlist-test-agent",
+          "allowed-child-agents:",
+        ].join("\n"),
+      );
+
+      assert.deepEqual(
+        testApi.loadAgentDefaults("allowlist-test-agent")?.allowedChildAgents,
+        ["mem-import-extractor", "mem-import-proposer"],
+      );
+      assert.deepEqual(testApi.loadAgentDefaults("empty-allowlist-test-agent")?.allowedChildAgents, []);
+    });
+  });
+
+  it("enforces the host-provided child-profile policy before launch", () => {
+    const previous = process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS;
+    try {
+      process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS = JSON.stringify(["mem-import-extractor"]);
+      assert.doesNotThrow(() => testApi.assertAllowedChildAgent("mem-import-extractor"));
+      assert.throws(
+        () => testApi.assertAllowedChildAgent("reviewer"),
+        /Child profile "reviewer" is not allowed/,
+      );
+      assert.throws(
+        () => testApi.assertAllowedChildAgent(undefined),
+        /requires an explicit allowed child profile/,
+      );
+
+      process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS = "[]";
+      assert.throws(() => testApi.assertAllowedChildAgent("anything"), /not allowed/);
+      process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS = "not-json";
+      assert.throws(() => testApi.assertAllowedChildAgent("anything"), /not allowed/);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_ALLOWED_CHILD_AGENTS", previous);
+    }
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(

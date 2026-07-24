@@ -57,6 +57,8 @@ export interface UnsignedSubagentLaunchProfile {
   /** Absolute caller entries exported for recursive descendants. */
   inheritedExtensionEntries: string[];
   configRoot: string;
+  /** Exact named child profiles allowed by the host-resolved parent profile. */
+  allowedChildAgents?: string[] | null;
 }
 
 export interface SubagentLaunchProfile extends UnsignedSubagentLaunchProfile {
@@ -168,6 +170,13 @@ function validateUnsignedFields(value: Record<string, unknown>): UnsignedSubagen
       { absolute: true },
     ),
     configRoot: validateString(value.configRoot, "configRoot", { absolute: true }),
+    ...(value.allowedChildAgents === undefined
+      ? {}
+      : {
+          allowedChildAgents: value.allowedChildAgents === null
+            ? null
+            : validateStringList(value.allowedChildAgents, "allowedChildAgents", MAX_PROFILE_TOOLS),
+        }),
   };
 }
 
@@ -175,7 +184,7 @@ export function validateUnsignedLaunchProfile(value: unknown): UnsignedSubagentL
   if (!isRecord(value)) throw new Error("launch profile must be an object");
   const allowedKeys = new Set([
     "version", "model", "thinking", "cwd", "agent", "toolAllowlist", "deniedTools",
-    "extensionMode", "extensionEntries", "inheritedExtensionEntries", "configRoot",
+    "extensionMode", "extensionEntries", "inheritedExtensionEntries", "configRoot", "allowedChildAgents",
   ]);
   const unknown = Object.keys(value).filter((key) => !allowedKeys.has(key));
   if (unknown.length > 0) throw new Error(`launch profile contains unsupported fields: ${unknown.join(", ")}`);
@@ -186,7 +195,7 @@ export function validateLaunchProfile(value: unknown): SubagentLaunchProfile {
   if (!isRecord(value)) throw new Error("launch profile must be an object");
   const allowedKeys = new Set([
     "version", "model", "thinking", "cwd", "agent", "toolAllowlist", "deniedTools",
-    "extensionMode", "extensionEntries", "inheritedExtensionEntries", "configRoot", "attestation",
+    "extensionMode", "extensionEntries", "inheritedExtensionEntries", "configRoot", "allowedChildAgents", "attestation",
   ]);
   const unknown = Object.keys(value).filter((key) => !allowedKeys.has(key));
   if (unknown.length > 0) throw new Error(`launch profile contains unsupported fields: ${unknown.join(", ")}`);
@@ -404,6 +413,7 @@ export function buildResumeProfileLaunch(
     env: {
       PI_CODING_AGENT_DIR: validated.configRoot,
       PI_DENY_TOOLS: validated.deniedTools.join(","),
+      PI_SUBAGENT_ALLOWED_CHILD_AGENTS: JSON.stringify(validated.allowedChildAgents ?? null),
       PI_SUBAGENT_EXTENSION_MODE: validated.extensionMode,
       PI_SUBAGENT_EXTENSIONS: validated.inheritedExtensionEntries.join(","),
       PI_SUBAGENT_AGENT: validated.agent ?? "",

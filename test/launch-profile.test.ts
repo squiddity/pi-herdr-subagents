@@ -45,6 +45,7 @@ const unsignedProfile: UnsignedSubagentLaunchProfile = {
   ],
   inheritedExtensionEntries: ["/workspace/tools/memory-import.ts"],
   configRoot: "/workspace/child/.pi/agent",
+  allowedChildAgents: ["mem-import-extractor"],
 };
 
 function fixture(dir: string): {
@@ -93,6 +94,7 @@ describe("Pi subagent launch profiles", () => {
         { ...profile, extensionEntries: [...profile.extensionEntries, "/tmp/payload.ts"] },
         { ...profile, configRoot: "/tmp/attacker-config" },
         { ...profile, cwd: "/tmp/attacker-cwd" },
+        { ...profile, allowedChildAgents: ["reviewer"] },
       ];
       for (const mutation of mutations) {
         writeFileSync(path, `${JSON.stringify(mutation)}\n`);
@@ -230,6 +232,7 @@ describe("Pi subagent launch profiles", () => {
         "--tools", "read,bash,subagent,caller_ping,subagent_done",
       ]);
       assert.equal(launch.env.PI_SUBAGENT_AGENT, "reviewer");
+      assert.equal(launch.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS, '["mem-import-extractor"]');
       assert.equal(buildResumeProfileLaunch(session, { ...profile, agent: null }).env.PI_SUBAGENT_AGENT, "");
       assert.equal(launch.env.PI_CODING_AGENT_DIR, "/workspace/child/.pi/agent");
       assert.equal(launch.env.PI_DENY_TOOLS, "subagent,subagent_resume");
