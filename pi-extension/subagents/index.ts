@@ -59,6 +59,7 @@ import {
   type UnsignedSubagentLaunchProfile,
 } from "./launch-profile.ts";
 import { assertRegularFile, UnsafeFileError } from "./safe-file.ts";
+import { registerDescendant, unregisterDescendant } from "./descendant-registry.ts";
 
 import {
   findLastAssistantMessage,
@@ -686,6 +687,7 @@ interface RunningSubagent {
   launchProfilePath?: string;
   profileWarning?: string;
   toolProfile?: ToolProfileEvidence;
+  descendantRegistryPath?: string;
 }
 
 interface SubagentRuntime {
@@ -734,6 +736,16 @@ export function shouldDeliverSubagentCompletion(
 
 export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
   return current ?? previous;
+}
+
+function unregisterRunningDescendant(running: RunningSubagent): void {
+  if (!running.descendantRegistryPath) return;
+  try {
+    unregisterDescendant(running.descendantRegistryPath, running.id);
+  } catch {
+    // Completion delivery must not be stranded by an already-corrupt host
+    // registry. The child-side done guard remains fail-closed on that input.
+  }
 }
 
 // ── Widget management ──
@@ -1384,6 +1396,7 @@ async function launchSubagent(
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
+  const descendantRegistryPath = join(artifactDir, "descendants.json");
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1533,6 +1546,7 @@ async function launchSubagent(
     );
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
+  envParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(descendantRegistryPath)}`);
   envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent ?? "")}`);
   envParts.push(`PI_SUBAGENT_ALLOWED_CHILD_AGENTS=${shellQuote(JSON.stringify(agentDefs?.allowedChildAgents ?? null))}`);
   envParts.push(`PI_SUBAGENT_AUTO_EXIT=${shellQuote(effectiveAutoExit ? "1" : "")}`);
@@ -1585,15 +1599,25 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  runScriptInPane(surface, command, {
-    scriptPath: launchScriptFile,
+  registerDescendant(descendantRegistryPath, {
+    id,
+    name: params.name,
+    state: "starting",
+  });
+  try {
+    runScriptInPane(surface, command, {
+      scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
       `# Generated: ${new Date().toISOString()}`,
       `# Session: ${subagentSessionFile}`,
       `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+      ].join("\n"),
+    });
+  } catch (error) {
+    unregisterRunningDescendant({ id, name: params.name, task: params.task, surface, startTime, sessionFile: subagentSessionFile, interactive: effectiveInteractive, runtimePlan, lifecycle: createLifecycle(startTime), descendantRegistryPath });
+    throw error;
+  }
 
   const running: RunningSubagent = {
     id,
@@ -1609,6 +1633,7 @@ async function launchSubagent(
     runtimePlan,
     launchProfile,
     launchProfilePath,
+    descendantRegistryPath,
     lifecycle: createLifecycle(startTime),
   };
 
@@ -1936,11 +1961,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((result) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+              unregisterRunningDescendant(running);
               runningSubagents.delete(running.id);
               updateWidget();
               return;
             }
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            unregisterRunningDescendant(running);
             runningSubagents.delete(running.id);
             updateWidget();
             const completionApi = selectCompletionApi(pi, runtime.pi);
@@ -1996,11 +2023,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .catch((err) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+              unregisterRunningDescendant(running);
               runningSubagents.delete(running.id);
               updateWidget();
               return;
             }
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            unregisterRunningDescendant(running);
             runningSubagents.delete(running.id);
             updateWidget();
             selectCompletionApi(pi, runtime.pi).sendMessage(
@@ -2353,6 +2382,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+        const descendantRegistryPath = join(artifactDir, "descendants.json");
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2378,6 +2408,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ? Object.entries(profileLaunch.env).map(([key, value]) => `${key}=${shellQuote(value)}`)
           : [];
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(descendantRegistryPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
@@ -2399,16 +2430,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        runScriptInPane(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
+        registerDescendant(descendantRegistryPath, { id, name, state: "starting" });
+        try {
+          runScriptInPane(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
             `# Generated: ${new Date().toISOString()}`,
             `# Session: ${sessionPath}`,
             `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          });
+        } catch (error) {
+          unregisterRunningDescendant({ id, name, task: params.message ?? "resumed session", surface, startTime, sessionFile: sessionPath, interactive, runtimePlan: launchProfile ? runtimePlanFromLaunchProfile(launchProfile) : undefined, lifecycle: createLifecycle(startTime), descendantRegistryPath });
+          throw error;
+        }
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2426,6 +2463,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchProfile,
           launchProfilePath: profileRead.path,
           profileWarning,
+          descendantRegistryPath,
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);
@@ -2440,11 +2478,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((result) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+              unregisterRunningDescendant(running);
               runningSubagents.delete(running.id);
               updateWidget();
               return;
             }
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            unregisterRunningDescendant(running);
             runningSubagents.delete(running.id);
             updateWidget();
             const completionApi = selectCompletionApi(pi, runtime.pi);
@@ -2507,11 +2547,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .catch((err) => {
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
+              unregisterRunningDescendant(running);
               runningSubagents.delete(running.id);
               updateWidget();
               return;
             }
             running.lifecycle = markDelivery(running.lifecycle, "delivered");
+            unregisterRunningDescendant(running);
             runningSubagents.delete(running.id);
             updateWidget();
             selectCompletionApi(pi, runtime.pi).sendMessage(

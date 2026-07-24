@@ -8,6 +8,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { readTrackedDescendants } from "./descendant-registry.ts";
 import {
   LAUNCH_PROFILE_VERSION,
   parseLaunchProfileAttestation,
@@ -329,6 +330,14 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      const descendantsFile = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+      if (descendantsFile) {
+        const descendants = readTrackedDescendants(descendantsFile);
+        if (descendants.length > 0) {
+          const summary = descendants.map((child) => `${child.name} [${child.id}]`).join(", ");
+          throw new Error(`Cannot complete while tracked descendants remain: ${summary}`);
+        }
+      }
       recorder.subagentDone();
       if (sessionFile) {
         writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));

@@ -58,6 +58,7 @@ import {
   MAX_ACTIVITY_FILE_BYTES,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
+import { registerDescendant } from "../pi-extension/subagents/descendant-registry.ts";
 import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
@@ -1486,6 +1487,30 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("refuses completion while a tracked descendant remains", async () => {
+    const dir = createTestDir();
+    try {
+      const descendantsFile = join(dir, "descendants.json");
+      registerDescendant(descendantsFile, { id: "child-1", name: "Child one", state: "waiting-for-terminal-delivery" });
+      const previous = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+      process.env.PI_SUBAGENT_DESCENDANTS_FILE = descendantsFile;
+      try {
+        const { api, registeredTools } = createMockExtensionApi();
+        subagentDoneExtension(api as any);
+        const done = registeredTools.find((tool) => tool.name === "subagent_done");
+        assert.ok(done);
+        await assert.rejects(
+          done.execute("call-1", {}, undefined, undefined, { shutdown() {} }),
+          /tracked descendants remain: Child one \[child-1\]/,
+        );
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previous);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("captures active tools at before_agent_start after awaited startup handlers", async () => {
     await withIsolatedAgentEnv(async ({ projectDir }) => {
       const activityFile = join(projectDir, "activity.json");
