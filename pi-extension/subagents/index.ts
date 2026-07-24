@@ -59,7 +59,12 @@ import {
   type UnsignedSubagentLaunchProfile,
 } from "./launch-profile.ts";
 import { assertRegularFile, UnsafeFileError } from "./safe-file.ts";
-import { registerDescendant, unregisterDescendant } from "./descendant-registry.ts";
+import {
+  childDescendantRegistryPath,
+  parentDescendantRegistryPath,
+  registerDescendant,
+  unregisterDescendant,
+} from "./descendant-registry.ts";
 
 import {
   findLastAssistantMessage,
@@ -687,7 +692,8 @@ interface RunningSubagent {
   launchProfilePath?: string;
   profileWarning?: string;
   toolProfile?: ToolProfileEvidence;
-  descendantRegistryPath?: string;
+  /** Registry owned by this process's parent; contains this running child. */
+  parentDescendantRegistryPath?: string;
 }
 
 interface SubagentRuntime {
@@ -739,9 +745,9 @@ export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
 }
 
 function unregisterRunningDescendant(running: RunningSubagent): void {
-  if (!running.descendantRegistryPath) return;
+  if (!running.parentDescendantRegistryPath) return;
   try {
-    unregisterDescendant(running.descendantRegistryPath, running.id);
+    unregisterDescendant(running.parentDescendantRegistryPath, running.id);
   } catch {
     // Completion delivery must not be stranded by an already-corrupt host
     // registry. The child-side done guard remains fail-closed on that input.
@@ -1396,7 +1402,8 @@ async function launchSubagent(
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
-  const descendantRegistryPath = join(artifactDir, "descendants.json");
+  const parentRegistryPath = parentDescendantRegistryPath();
+  const childRegistryPath = childDescendantRegistryPath(artifactDir, subagentSessionFile);
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1546,7 +1553,7 @@ async function launchSubagent(
     );
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
-  envParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(descendantRegistryPath)}`);
+  envParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
   envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent ?? "")}`);
   envParts.push(`PI_SUBAGENT_ALLOWED_CHILD_AGENTS=${shellQuote(JSON.stringify(agentDefs?.allowedChildAgents ?? null))}`);
   envParts.push(`PI_SUBAGENT_AUTO_EXIT=${shellQuote(effectiveAutoExit ? "1" : "")}`);
@@ -1599,11 +1606,13 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  registerDescendant(descendantRegistryPath, {
-    id,
-    name: params.name,
-    state: "starting",
-  });
+  if (parentRegistryPath) {
+    registerDescendant(parentRegistryPath, {
+      id,
+      name: params.name,
+      state: "starting",
+    });
+  }
   try {
     runScriptInPane(surface, command, {
       scriptPath: launchScriptFile,
@@ -1615,7 +1624,7 @@ async function launchSubagent(
       ].join("\n"),
     });
   } catch (error) {
-    unregisterRunningDescendant({ id, name: params.name, task: params.task, surface, startTime, sessionFile: subagentSessionFile, interactive: effectiveInteractive, runtimePlan, lifecycle: createLifecycle(startTime), descendantRegistryPath });
+    unregisterRunningDescendant({ id, name: params.name, task: params.task, surface, startTime, sessionFile: subagentSessionFile, interactive: effectiveInteractive, runtimePlan, lifecycle: createLifecycle(startTime), parentDescendantRegistryPath: parentRegistryPath });
     throw error;
   }
 
@@ -1633,7 +1642,7 @@ async function launchSubagent(
     runtimePlan,
     launchProfile,
     launchProfilePath,
-    descendantRegistryPath,
+    parentDescendantRegistryPath: parentRegistryPath,
     lifecycle: createLifecycle(startTime),
   };
 
@@ -2382,7 +2391,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
-        const descendantRegistryPath = join(artifactDir, "descendants.json");
+        const parentRegistryPath = parentDescendantRegistryPath();
+        const childRegistryPath = childDescendantRegistryPath(artifactDir, sessionPath);
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2408,7 +2418,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ? Object.entries(profileLaunch.env).map(([key, value]) => `${key}=${shellQuote(value)}`)
           : [];
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(descendantRegistryPath)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
@@ -2430,7 +2440,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        registerDescendant(descendantRegistryPath, { id, name, state: "starting" });
+        if (parentRegistryPath) registerDescendant(parentRegistryPath, { id, name, state: "starting" });
         try {
           runScriptInPane(surface, command, {
             scriptPath: launchScriptFile,
@@ -2443,7 +2453,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ].join("\n"),
           });
         } catch (error) {
-          unregisterRunningDescendant({ id, name, task: params.message ?? "resumed session", surface, startTime, sessionFile: sessionPath, interactive, runtimePlan: launchProfile ? runtimePlanFromLaunchProfile(launchProfile) : undefined, lifecycle: createLifecycle(startTime), descendantRegistryPath });
+          unregisterRunningDescendant({ id, name, task: params.message ?? "resumed session", surface, startTime, sessionFile: sessionPath, interactive, runtimePlan: launchProfile ? runtimePlanFromLaunchProfile(launchProfile) : undefined, lifecycle: createLifecycle(startTime), parentDescendantRegistryPath: parentRegistryPath });
           throw error;
         }
 
@@ -2463,7 +2473,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchProfile,
           launchProfilePath: profileRead.path,
           profileWarning,
-          descendantRegistryPath,
+          parentDescendantRegistryPath: parentRegistryPath,
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);

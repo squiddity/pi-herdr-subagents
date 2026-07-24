@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -6,7 +7,7 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const REGISTRY_VERSION = 1;
 const MAX_REGISTRY_BYTES = 64 * 1024;
@@ -95,4 +96,20 @@ export function unregisterDescendant(path: string, id: string): void {
 
 export function readTrackedDescendants(path: string): DescendantRegistryEntry[] {
   return readRegistry(path).entries;
+}
+
+/**
+ * Return the registry owned by one child session. The path is stable across
+ * resume and distinct for sibling sessions launched from the same artifact
+ * root. A child receives this path; it is never registered in this registry.
+ */
+export function childDescendantRegistryPath(artifactDir: string, childSessionFile: string): string {
+  const sessionKey = createHash("sha256").update(resolve(childSessionFile)).digest("hex").slice(0, 32);
+  return join(artifactDir, "descendant-registries", `${sessionKey}.json`);
+}
+
+/** The current process's host-owned registry, when this process is itself a child. */
+export function parentDescendantRegistryPath(envValue = process.env.PI_SUBAGENT_DESCENDANTS_FILE): string | undefined {
+  const path = envValue?.trim();
+  return path || undefined;
 }

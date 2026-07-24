@@ -279,10 +279,11 @@ for (const backend of backends) {
 
       const screen = await waitForScreen(
         surface,
-        new RegExp(`RECURSIVE_COMPLETE_${id}|RECURSIVE_PARENT_OK_${id}`),
+        new RegExp(`RECURSIVE_COMPLETE_${id}`),
         PI_TIMEOUT,
       );
-      assert.match(screen, new RegExp(`RECURSIVE_COMPLETE_${id}|RECURSIVE_PARENT_OK_${id}`));
+      assert.match(screen, new RegExp(`RECURSIVE_COMPLETE_${id}`));
+      assert.doesNotMatch(screen, /Cannot complete while tracked descendants remain/);
     });
 
     // ── caller_ping ──

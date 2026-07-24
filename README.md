@@ -489,6 +489,8 @@ subagent({
 });
 ```
 
+`subagent_done` fails closed while the caller still has tracked direct descendants. Tracking uses a parent-owned registry for each child registration and a distinct child-owned registry for that child's descendants; the child registry is stable across resume and isolated from sibling sessions. A terminal child is removed before its result is delivered, so the recursive parent can process the pushed result and complete without polling.
+
 ### `interactive`
 
 Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.

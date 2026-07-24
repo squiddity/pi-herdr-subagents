@@ -58,7 +58,11 @@ import {
   MAX_ACTIVITY_FILE_BYTES,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import { registerDescendant } from "../pi-extension/subagents/descendant-registry.ts";
+import {
+  childDescendantRegistryPath,
+  parentDescendantRegistryPath,
+  registerDescendant,
+} from "../pi-extension/subagents/descendant-registry.ts";
 import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
@@ -1487,6 +1491,44 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("separates the parent-owned registration from each child's stable registry", () => {
+    const dir = createTestDir();
+    try {
+      const sessionOne = join(dir, "session-one.jsonl");
+      const first = childDescendantRegistryPath(dir, sessionOne);
+      assert.equal(childDescendantRegistryPath(dir, sessionOne), first, "resume must reuse the child registry");
+      assert.notEqual(childDescendantRegistryPath(dir, join(dir, "session-two.jsonl")), first, "siblings need distinct registries");
+      assert.equal(parentDescendantRegistryPath("  /tmp/parent-descendants.json  "), "/tmp/parent-descendants.json");
+      assert.equal(parentDescendantRegistryPath(""), undefined);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("allows a child to complete when only its parent registry contains the child itself", async () => {
+    const dir = createTestDir();
+    try {
+      const parentRegistry = join(dir, "parent-descendants.json");
+      const childRegistry = childDescendantRegistryPath(dir, join(dir, "child-session.jsonl"));
+      registerDescendant(parentRegistry, { id: "child-self", name: "Child self", state: "active" });
+      const previous = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+      process.env.PI_SUBAGENT_DESCENDANTS_FILE = childRegistry;
+      let shutdown = false;
+      try {
+        const { api, registeredTools } = createMockExtensionApi();
+        subagentDoneExtension(api as any);
+        const done = registeredTools.find((tool) => tool.name === "subagent_done");
+        assert.ok(done);
+        await done.execute("call-self", {}, undefined, undefined, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previous);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses completion while a tracked descendant remains", async () => {
     const dir = createTestDir();
     try {
