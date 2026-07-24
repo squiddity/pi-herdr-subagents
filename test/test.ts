@@ -1008,10 +1008,10 @@ describe("subagent discovery", () => {
   it("fails closed for an unknown explicit profile instead of returning bare defaults", async () => {
     await withIsolatedAgentEnv(async () => {
       assert.throws(
-        () => testApi.resolveExplicitAgentDefaults("proposer"),
-        new Error('Unknown named subagent profile "proposer"'),
+        () => testApi.resolveExplicitAgentDefaults("missing-profile"),
+        new Error('Unknown named subagent profile "missing-profile"'),
       );
-      assert.equal(testApi.loadAgentDefaults("proposer"), null);
+      assert.equal(testApi.loadAgentDefaults("missing-profile"), null);
     });
   });
 
@@ -1022,7 +1022,7 @@ describe("subagent discovery", () => {
         "allowlist-test-agent",
         [
           "name: allowlist-test-agent",
-          "allowed-child-agents: mem-import-extractor, mem-import-proposer",
+          "allowed-child-agents: child-reader, child-writer",
         ].join("\n"),
       );
       writeAgentFile(
@@ -1036,7 +1036,7 @@ describe("subagent discovery", () => {
 
       assert.deepEqual(
         testApi.loadAgentDefaults("allowlist-test-agent")?.allowedChildAgents,
-        ["mem-import-extractor", "mem-import-proposer"],
+        ["child-reader", "child-writer"],
       );
       assert.deepEqual(testApi.loadAgentDefaults("empty-allowlist-test-agent")?.allowedChildAgents, []);
     });
@@ -1045,8 +1045,8 @@ describe("subagent discovery", () => {
   it("enforces the host-provided child-profile policy before launch", () => {
     const previous = process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS;
     try {
-      process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS = JSON.stringify(["mem-import-extractor"]);
-      assert.doesNotThrow(() => testApi.assertAllowedChildAgent("mem-import-extractor"));
+      process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS = JSON.stringify(["child-reader"]);
+      assert.doesNotThrow(() => testApi.assertAllowedChildAgent("child-reader"));
       assert.throws(
         () => testApi.assertAllowedChildAgent("reviewer"),
         /Child profile "reviewer" is not allowed/,

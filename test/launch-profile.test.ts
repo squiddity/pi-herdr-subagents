@@ -41,11 +41,11 @@ const unsignedProfile: UnsignedSubagentLaunchProfile = {
   extensionEntries: [
     "/package/pi-extension/subagents/index.ts",
     "/package/pi-extension/subagents/subagent-done.ts",
-    "/workspace/tools/memory-import.ts",
+    "/workspace/tools/example-child-extension.ts",
   ],
-  inheritedExtensionEntries: ["/workspace/tools/memory-import.ts"],
+  inheritedExtensionEntries: ["/workspace/tools/example-child-extension.ts"],
   configRoot: "/workspace/child/.pi/agent",
-  allowedChildAgents: ["mem-import-extractor"],
+  allowedChildAgents: ["child-reader"],
 };
 
 function fixture(dir: string): {
@@ -226,13 +226,13 @@ describe("Pi subagent launch profiles", () => {
         "--no-extensions",
         "-e", "/package/pi-extension/subagents/index.ts",
         "-e", "/package/pi-extension/subagents/subagent-done.ts",
-        "-e", "/workspace/tools/memory-import.ts",
+        "-e", "/workspace/tools/example-child-extension.ts",
         "--model", "openai/gpt-test",
         "--thinking", "high",
         "--tools", "read,bash,subagent,caller_ping,subagent_done",
       ]);
       assert.equal(launch.env.PI_SUBAGENT_AGENT, "reviewer");
-      assert.equal(launch.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS, '["mem-import-extractor"]');
+      assert.equal(launch.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS, '["child-reader"]');
       assert.equal(buildResumeProfileLaunch(session, { ...profile, agent: null }).env.PI_SUBAGENT_AGENT, "");
       assert.equal(launch.env.PI_CODING_AGENT_DIR, "/workspace/child/.pi/agent");
       assert.equal(launch.env.PI_DENY_TOOLS, "subagent,subagent_resume");
