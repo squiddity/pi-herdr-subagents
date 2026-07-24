@@ -1986,6 +1986,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                   ...(running.launchProfilePath ? { launchProfilePath: running.launchProfilePath } : {}),
+                  ...(running.launchProfile ? { allowedChildAgents: running.launchProfile.allowedChildAgents ?? null } : {}),
                   ...(running.toolProfile ? { toolProfile: running.toolProfile } : {}),
                 },
               },
@@ -2036,6 +2037,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             thinking: running.runtimePlan?.thinking,
             runtimePlan: running.runtimePlan,
             launchProfilePath: running.launchProfilePath,
+            ...(running.launchProfile ? { allowedChildAgents: running.launchProfile.allowedChildAgents ?? null } : {}),
             status: "started",
           },
         };
