@@ -475,6 +475,19 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   return null;
 }
 
+/**
+ * Resolve an explicitly requested profile before any launch side effects.
+ * An omitted agent intentionally means a bare spawn; an unresolved explicit
+ * key is a configuration error and must never fall through to that behavior.
+ */
+function resolveExplicitAgentDefaults(agentName: string): AgentDefaults {
+  const agentDefs = loadAgentDefaults(agentName);
+  if (!agentDefs) {
+    throw new Error(`Unknown named subagent profile "${agentName}"`);
+  }
+  return agentDefs;
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -1155,6 +1168,7 @@ export const __test__ = {
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
+  resolveExplicitAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -1210,7 +1224,9 @@ async function launchSubagent(
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const agentDefs = params.agent !== undefined
+    ? resolveExplicitAgentDefaults(params.agent)
+    : null;
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },

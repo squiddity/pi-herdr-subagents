@@ -1004,6 +1004,16 @@ describe("model configuration", () => {
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  it("fails closed for an unknown explicit profile instead of returning bare defaults", async () => {
+    await withIsolatedAgentEnv(async () => {
+      assert.throws(
+        () => testApi.resolveExplicitAgentDefaults("proposer"),
+        new Error('Unknown named subagent profile "proposer"'),
+      );
+      assert.equal(testApi.loadAgentDefaults("proposer"), null);
+    });
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
