@@ -2441,6 +2441,109 @@ describe("subagent activity snapshots", () => {
     });
   });
 
+  it("records provider usage without persisting message content", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "usage-child");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "usage-child",
+        activityFile,
+        now: () => 1_000,
+      });
+
+      recorder.sessionStart();
+      recorder.turnStart(1);
+      recorder.messageEnd({
+        role: "assistant",
+        provider: "openai-codex",
+        model: "gpt-test",
+        secretPrompt: "must not be persisted",
+        usage: {
+          input: 10,
+          output: 7,
+          cacheRead: 3,
+          cacheWrite: 2,
+          reasoning: 4,
+          totalTokens: 20,
+          cost: { input: 1, output: 2, cacheRead: 0.3, cacheWrite: 0.2, total: 3.5 },
+        },
+      });
+      recorder.messageEnd({ role: "user", content: "also not persisted" });
+
+      const read = readSubagentActivityFile(activityFile, "usage-child");
+      assert.ok(read.ok);
+      assert.deepEqual(read.activity.usage, {
+        version: 1,
+        sessions: 1,
+        turns: 1,
+        responses: 1,
+        inputTokens: 10,
+        outputTokens: 7,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
+        reasoningTokens: 4,
+        totalTokens: 20,
+        cost: { input: 1, output: 2, cacheRead: 0.3, cacheWrite: 0.2, total: 3.5 },
+      });
+      assert.deepEqual(read.activity.usageByModel, [{
+        version: 1,
+        provider: "openai-codex",
+        model: "gpt-test",
+        responses: 1,
+        inputTokens: 10,
+        outputTokens: 7,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
+        reasoningTokens: 4,
+        totalTokens: 20,
+        cost: { input: 1, output: 2, cacheRead: 0.3, cacheWrite: 0.2, total: 3.5 },
+      }]);
+      assert.equal(JSON.stringify(read.activity).includes("secretPrompt"), false);
+      assert.equal(JSON.stringify(read.activity).includes("also not persisted"), false);
+    });
+  });
+
+  it("preserves cumulative usage across profile-preserving resume", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "resume-usage-child");
+      const first = createSubagentActivityRecorder({
+        runningChildId: "resume-usage-child",
+        activityFile,
+        now: () => 1_000,
+      });
+      first.sessionStart();
+      first.turnStart(1);
+      first.messageEnd({
+        role: "assistant",
+        provider: "provider-a",
+        model: "model-a",
+        usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      });
+
+      const resumed = createSubagentActivityRecorder({
+        runningChildId: "resume-usage-child",
+        activityFile,
+        now: () => 2_000,
+      });
+      resumed.sessionStart();
+      resumed.turnStart(1);
+      resumed.messageEnd({
+        role: "assistant",
+        provider: "provider-a",
+        model: "model-a",
+        usage: { input: 4, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 9, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      });
+
+      const read = readSubagentActivityFile(activityFile, "resume-usage-child");
+      assert.ok(read.ok);
+      assert.equal(read.activity.usage.sessions, 2);
+      assert.equal(read.activity.usage.turns, 2);
+      assert.equal(read.activity.usage.responses, 2);
+      assert.equal(read.activity.usage.inputTokens, 6);
+      assert.equal(read.activity.usage.totalTokens, 14);
+      assert.equal(read.activity.usageByModel[0]?.responses, 2);
+    });
+  });
+
   it("records waiting and final done states", () => {
     withTempDir((dir) => {
       let currentNow = 2_000;

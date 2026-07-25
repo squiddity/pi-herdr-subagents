@@ -252,6 +252,10 @@ export default function (pi: ExtensionAPI) {
     recorder.messageUpdate((event as any).assistantMessageEvent?.type);
   });
 
+  pi.on("message_end", (event) => {
+    recorder.messageEnd((event as any).message);
+  });
+
   pi.on("tool_execution_start", (event) => {
     recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
   });

@@ -343,6 +343,17 @@ the expected allowlist, and reports denied names that remain active. Evidence is
 **exact**, **mismatch**, **unrestricted** (no allowlist only after deny checks), or
 **unverified**.
 
+### Usage telemetry
+
+Pi-backed child activity snapshots also carry schema-versioned, content-free usage totals. The
+host records sessions, turns, assistant responses, input/output/cache/reasoning/total tokens,
+provider-reported cost, and bounded per-provider/model buckets. A provider metric that is not
+reported remains `null`; the extension never estimates it. Completion messages expose the same
+usage snapshot alongside the host-resolved runtime profile, so a parent can aggregate totals by
+role, model, phase, and session without receiving prompts, message content, grants, credentials,
+hidden reasoning, or account identifiers. Profile-preserving resumes continue the same cumulative
+usage snapshot.
+
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)

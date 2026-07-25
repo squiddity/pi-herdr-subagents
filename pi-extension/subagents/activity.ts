@@ -17,6 +17,7 @@ export type SubagentActivityEvent =
   | "before_provider_request"
   | "after_provider_response"
   | "message_update"
+  | "message_end"
   | "tool_execution_start"
   | "tool_call"
   | "tool_execution_update"
@@ -26,6 +27,42 @@ export type SubagentActivityEvent =
   | "subagent_done"
   | "session_shutdown";
 
+export interface SubagentUsageCost {
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  total: number | null;
+}
+
+export interface SubagentUsageTotals {
+  version: 1;
+  sessions: number;
+  turns: number;
+  responses: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  reasoningTokens: number | null;
+  totalTokens: number | null;
+  cost: SubagentUsageCost;
+}
+
+export interface SubagentModelUsage {
+  version: 1;
+  provider: string;
+  model: string;
+  responses: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  reasoningTokens: number | null;
+  totalTokens: number | null;
+  cost: SubagentUsageCost;
+}
+
 export interface SubagentActivityState {
   version: 1;
   runningChildId: string;
@@ -34,6 +71,8 @@ export interface SubagentActivityState {
   sequence: number;
   latestEvent: SubagentActivityEvent;
   phase: SubagentActivityPhase;
+  usage: SubagentUsageTotals;
+  usageByModel: SubagentModelUsage[];
   agentActive: boolean;
   turnActive: boolean;
   providerActive: boolean;
@@ -62,6 +101,7 @@ export type SubagentShutdownReason = "quit" | "reload" | "new" | "resume" | "for
 export interface SubagentActivityRecorder {
   sessionStart(actualTools?: string[], deniedTools?: string[]): void;
   toolTelemetry(actualTools: string[], deniedTools: string[]): void;
+  messageEnd(message: unknown): void;
   input(): void;
   beforeAgentStart(): void;
   agentStart(): void;
@@ -98,6 +138,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "before_provider_request",
   "after_provider_response",
   "message_update",
+  "message_end",
   "tool_execution_start",
   "tool_call",
   "tool_execution_update",
@@ -109,6 +150,8 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
 const MAX_ACTIVITY_TOOL_NAMES = 256;
+const MAX_ACTIVITY_MODEL_USAGES = 64;
+const MAX_USAGE_IDENTIFIER_LENGTH = 200;
 export const MAX_ACTIVITY_FILE_BYTES = 128 * 1024;
 
 export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
@@ -185,6 +228,73 @@ function normalizeToolNames(values: string[] | undefined): string[] | undefined 
   return [...names].sort();
 }
 
+function validateUsageIdentifier(value: unknown, fieldName: string): string | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_USAGE_IDENTIFIER_LENGTH || /\r|\n/.test(value)) {
+    return `${fieldName} must be a non-empty bounded string`;
+  }
+  return null;
+}
+
+function validateUsageNumber(value: unknown, fieldName: string, integer: boolean): string | null {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || (integer && !Number.isInteger(value))) {
+    return `${fieldName} must be a non-negative ${integer ? "integer" : "finite number"} or null`;
+  }
+  return null;
+}
+
+function validateUsageCost(value: unknown, fieldName: string): string | null {
+  const object = requireObject(value);
+  if (!object) return `${fieldName} must be an object`;
+  return ["input", "output", "cacheRead", "cacheWrite", "total"]
+    .map((key) => validateUsageNumber(object[key], `${fieldName}.${key}`, false))
+    .find((error) => error != null) ?? null;
+}
+
+function validateUsage(value: unknown, fieldName = "usage"): string | null {
+  const object = requireObject(value);
+  if (!object) return `${fieldName} must be an object`;
+  if (object.version !== 1) return `${fieldName}.version must be 1`;
+
+  const countError = ["sessions", "turns", "responses"]
+    .map((key) => validateUsageNumber(object[key], `${fieldName}.${key}`, true))
+    .find((error) => error != null);
+  if (countError) return countError;
+
+  const tokenError = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens", "totalTokens"]
+    .map((key) => validateUsageNumber(object[key], `${fieldName}.${key}`, true))
+    .find((error) => error != null);
+  if (tokenError) return tokenError;
+
+  const costError = validateUsageCost(object.cost, `${fieldName}.cost`);
+  if (costError) return costError;
+
+  return null;
+}
+
+function validateUsageByModel(value: unknown, fieldName = "usageByModel"): string | null {
+  if (!Array.isArray(value)) return `${fieldName} must be an array`;
+  if (value.length > MAX_ACTIVITY_MODEL_USAGES) return `${fieldName} has too many entries`;
+  for (const [index, modelUsage] of value.entries()) {
+    const modelObject = requireObject(modelUsage);
+    if (!modelObject) return `${fieldName}[${index}] must be an object`;
+    const providerError = validateUsageIdentifier(modelObject.provider, `${fieldName}[${index}].provider`);
+    if (providerError) return providerError;
+    const modelError = validateUsageIdentifier(modelObject.model, `${fieldName}[${index}].model`);
+    if (modelError) return modelError;
+    if (modelObject.version !== 1) return `${fieldName}[${index}].version must be 1`;
+    const responseError = validateUsageNumber(modelObject.responses, `${fieldName}[${index}].responses`, true);
+    if (responseError) return responseError;
+    const tokenError = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens", "totalTokens"]
+      .map((key) => validateUsageNumber(modelObject[key], `${fieldName}[${index}].${key}`, true))
+      .find((error) => error != null);
+    if (tokenError) return tokenError;
+    const costError = validateUsageCost(modelObject.cost, `${fieldName}[${index}].cost`);
+    if (costError) return costError;
+  }
+  return null;
+}
+
 function invalidActivity(error: string): ActivityReadResult {
   return { ok: false, reason: "invalid", error };
 }
@@ -209,6 +319,8 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   }
 
   const validationError = [
+    object.usage == null ? null : validateUsage(object.usage),
+    object.usageByModel == null ? null : validateUsageByModel(object.usageByModel),
     validateFiniteNumber(object, "createdAt"),
     validateFiniteNumber(object, "updatedAt"),
     validateInteger(object, "sequence"),
@@ -274,10 +386,122 @@ export function writeSubagentActivityFile(activityFile: string, activity: Subage
   }
 }
 
+function emptyUsage(): SubagentUsageTotals {
+  return {
+    version: 1,
+    sessions: 0,
+    turns: 0,
+    responses: 0,
+    inputTokens: null,
+    outputTokens: null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    reasoningTokens: null,
+    totalTokens: null,
+    cost: {
+      input: null,
+      output: null,
+      cacheRead: null,
+      cacheWrite: null,
+      total: null,
+    },
+  };
+}
+
+function addUsageNumber(target: Record<string, any>, fieldName: string, value: unknown, integer: boolean): void {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || (integer && !Number.isInteger(value))) return;
+  target[fieldName] = target[fieldName] == null ? value : target[fieldName] + value;
+}
+
+function addUsageFields(target: SubagentUsageTotals | SubagentModelUsage, rawUsage: Record<string, unknown>): void {
+  addUsageNumber(target, "inputTokens", rawUsage.input, true);
+  addUsageNumber(target, "outputTokens", rawUsage.output, true);
+  addUsageNumber(target, "cacheReadTokens", rawUsage.cacheRead, true);
+  addUsageNumber(target, "cacheWriteTokens", rawUsage.cacheWrite, true);
+  addUsageNumber(target, "reasoningTokens", rawUsage.reasoning, true);
+  addUsageNumber(target, "totalTokens", rawUsage.totalTokens, true);
+
+  const rawCost = requireObject(rawUsage.cost);
+  if (!rawCost) return;
+  addUsageNumber(target.cost, "input", rawCost.input, false);
+  addUsageNumber(target.cost, "output", rawCost.output, false);
+  addUsageNumber(target.cost, "cacheRead", rawCost.cacheRead, false);
+  addUsageNumber(target.cost, "cacheWrite", rawCost.cacheWrite, false);
+  addUsageNumber(target.cost, "total", rawCost.total, false);
+}
+
+function cloneUsage(usage: SubagentUsageTotals | undefined): SubagentUsageTotals {
+  if (!usage) return emptyUsage();
+  return {
+    version: 1,
+    sessions: usage.sessions,
+    turns: usage.turns,
+    responses: usage.responses,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens,
+    reasoningTokens: usage.reasoningTokens,
+    totalTokens: usage.totalTokens,
+    cost: { ...usage.cost },
+  };
+}
+
+function cloneModelUsage(usage: SubagentModelUsage): SubagentModelUsage {
+  return { ...usage, cost: { ...usage.cost } };
+}
+
+function recordAssistantUsage(
+  usage: SubagentUsageTotals,
+  usageByModel: SubagentModelUsage[],
+  message: unknown,
+): void {
+  const object = requireObject(message);
+  if (object?.role !== "assistant") return;
+
+  usage.responses += 1;
+  const rawUsage = requireObject(object.usage);
+  if (rawUsage) addUsageFields(usage, rawUsage);
+
+  const provider = object.provider;
+  const model = object.model;
+  if (
+    typeof provider !== "string" ||
+    typeof model !== "string" ||
+    !provider ||
+    !model ||
+    provider.length > MAX_USAGE_IDENTIFIER_LENGTH ||
+    model.length > MAX_USAGE_IDENTIFIER_LENGTH ||
+    /\r|\n/.test(provider) ||
+    /\r|\n/.test(model)
+  ) return;
+  let modelUsage = usageByModel.find((entry) => entry.provider === provider && entry.model === model);
+  if (!modelUsage) {
+    if (usageByModel.length >= MAX_ACTIVITY_MODEL_USAGES) return;
+    modelUsage = {
+      version: 1,
+      provider,
+      model,
+      responses: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      reasoningTokens: null,
+      totalTokens: null,
+      cost: { input: null, output: null, cacheRead: null, cacheWrite: null, total: null },
+    };
+    usageByModel.push(modelUsage);
+  }
+  modelUsage.responses += 1;
+  if (rawUsage) addUsageFields(modelUsage, rawUsage);
+}
+
 function createNoopRecorder(): SubagentActivityRecorder {
   return {
     sessionStart() {},
     toolTelemetry() {},
+    messageEnd() {},
     input() {},
     beforeAgentStart() {},
     agentStart() {},
@@ -356,6 +580,7 @@ export function createSubagentActivityRecorder(params: {
 
   const now = params.now ?? (() => Date.now());
   const createdAt = now();
+  const previous = readSubagentActivityFile(activityFile, runningChildId);
   const activity: SubagentActivityState = {
     version: 1,
     runningChildId,
@@ -364,6 +589,8 @@ export function createSubagentActivityRecorder(params: {
     sequence: 0,
     latestEvent: "session_start",
     phase: "starting",
+    usage: cloneUsage(previous.ok ? previous.activity.usage : undefined),
+    usageByModel: previous.ok ? previous.activity.usageByModel?.map(cloneModelUsage) ?? [] : [],
     agentActive: false,
     turnActive: false,
     providerActive: false,
@@ -444,6 +671,7 @@ export function createSubagentActivityRecorder(params: {
     sessionStart(actualTools, deniedTools) {
       record("session_start", (current) => {
         current.phase = "starting";
+        current.usage.sessions += 1;
         clearActiveState(current);
         delete current.waitingSince;
         const normalizedActual = normalizeToolNames(actualTools);
@@ -460,6 +688,11 @@ export function createSubagentActivityRecorder(params: {
         else delete current.actualTools;
         if (normalizedDenied) current.deniedTools = normalizedDenied;
         else delete current.deniedTools;
+      }, "immediate");
+    },
+    messageEnd(message) {
+      record("message_end", (current) => {
+        recordAssistantUsage(current.usage, current.usageByModel, message);
       }, "immediate");
     },
     input() {
@@ -489,6 +722,7 @@ export function createSubagentActivityRecorder(params: {
     },
     turnStart(turnIndex) {
       record("turn_start", (current, observedAt) => {
+        current.usage.turns += 1;
         current.agentActive = true;
         current.turnActive = true;
         if (turnIndex != null) current.turnIndex = turnIndex;
