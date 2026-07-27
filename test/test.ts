@@ -2502,6 +2502,37 @@ describe("subagent activity snapshots", () => {
     });
   });
 
+  it("refreshes the final activity sidecar before completion details are constructed", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "completion-usage-child");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "completion-usage-child",
+        activityFile,
+        now: () => 2_000,
+      });
+      recorder.sessionStart();
+      recorder.turnStart(1);
+      recorder.messageEnd({
+        role: "assistant",
+        provider: "provider-a",
+        model: "model-a",
+        usage: { input: 11, output: 7, cacheRead: 5, cacheWrite: 0, totalTokens: 23, cost: { input: 0.1, output: 0.2, cacheRead: 0.05, cacheWrite: 0, total: 0.35 } },
+      });
+
+      const running = {
+        id: "completion-usage-child",
+        cli: "pi",
+        startTime: 1_000,
+        activityFile,
+        lifecycle: createLifecycle(1_000),
+      } as any;
+      assert.equal(running.activity, undefined, "cached completion state begins stale");
+      subagentsModule.refreshCompletionActivity(running, 2_001);
+      assert.equal(running.activity?.usage?.totalTokens, 23);
+      assert.equal(running.activity?.usageByModel?.[0]?.responses, 1);
+    });
+  });
+
   it("preserves cumulative usage across profile-preserving resume", () => {
     withTempDir((dir) => {
       const activityFile = getSubagentActivityFile(dir, "resume-usage-child");

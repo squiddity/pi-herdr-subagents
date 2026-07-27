@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -622,7 +622,7 @@ function runtimePlanFromLaunchProfile(profile: SubagentLaunchProfile): ResolvedR
 }
 
 function appendHostEvidence(presentation: string, running: RunningSubagent): string {
-  const lines = [presentation];
+  const lines = [presentation, `Host identity: runningChildId \`${running.id}\`; sessionId \`${basename(running.sessionFile, ".jsonl")}\`.`];
   if (running.runtimePlan?.runtimeMismatch) {
     lines.push(`Runtime warning: ${running.runtimePlan.runtimeMismatch}`);
   }
@@ -1047,6 +1047,11 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
 
   if (read.ok) running.activity = read.activity;
   running.lifecycle = observeActivity(ensureLifecycle(running), read, observedAt);
+}
+
+/** Final synchronous sidecar read used immediately before terminal result details are built. */
+export function refreshCompletionActivity(running: RunningSubagent, observedAt = Date.now()): void {
+  observeRunningSubagent(running, observedAt);
 }
 
 function resolveInterruptTarget(params: { id?: string; name?: string }):
@@ -1968,6 +1973,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            refreshCompletionActivity(running);
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               unregisterRunningDescendant(running);
@@ -2018,6 +2024,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  runningChildId: running.id,
+                  sessionId: basename(result.sessionFile, ".jsonl"),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
@@ -2488,6 +2496,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            refreshCompletionActivity(running);
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               unregisterRunningDescendant(running);
@@ -2545,6 +2554,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: sessionPath,
+                  runningChildId: running.id,
+                  sessionId: basename(sessionPath, ".jsonl"),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                   launchProfilePath: running.launchProfilePath,
