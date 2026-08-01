@@ -1215,12 +1215,6 @@ function buildIsolatedResumeArgs(sessionPath: string): string[] {
   return ["pi", "--session", sessionPath, "--no-extensions"];
 }
 
-function buildCompletionInstruction(autoExit: boolean): string {
-  return autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message should summarize what you accomplished. Then make a subagent_done tool call.";
-}
-
 function assertAutoExitOverrideSupported(
   backend: "pi" | "claude",
   autoExit: boolean | undefined,
@@ -1256,7 +1250,6 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   resolveResumeSessionPath,
   buildIsolatedResumeArgs,
-  buildCompletionInstruction,
   assertAutoExitOverrideSupported,
   runningSubagents,
   formatElapsed,
@@ -1424,7 +1417,9 @@ async function launchSubagent(
   const modeHint = effectiveAutoExit
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = buildCompletionInstruction(effectiveAutoExit);
+  const summaryInstruction = effectiveAutoExit
+    ? "Your FINAL assistant message should summarize what you accomplished."
+    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;

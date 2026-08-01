@@ -1210,17 +1210,6 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("makes manual subagent completion an explicit final step", () => {
-    assert.equal(
-      testApi.buildCompletionInstruction(false),
-      "Your FINAL assistant message should summarize what you accomplished. Then make a subagent_done tool call.",
-    );
-    assert.equal(
-      testApi.buildCompletionInstruction(true),
-      "Your FINAL assistant message should summarize what you accomplished.",
-    );
-  });
-
   it("rejects per-spawn autoExit overrides for Claude-backed agents", () => {
     assert.doesNotThrow(() => testApi.assertAutoExitOverrideSupported("pi", false));
     assert.doesNotThrow(() => testApi.assertAutoExitOverrideSupported("claude", undefined));
