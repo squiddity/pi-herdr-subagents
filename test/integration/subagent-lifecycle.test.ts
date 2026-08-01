@@ -248,7 +248,7 @@ for (const backend of backends) {
 
     // ── Recursive explicit mode ──
 
-    it("an explicit parent with autoExit false receives its child result before completing", async () => {
+    it("an auto-exit explicit parent defers completion until its child result is processed", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-recursive-${id}.txt`;
       trackTempFile(env, markerFile);
@@ -260,12 +260,12 @@ for (const backend of backends) {
         `Spawn exactly one child subagent whose task is:`,
         `Run this bash command: echo 'RECURSIVE_CHILD_OK_${id}' > '${markerFile}'`,
         `Wait for the child's automatic result delivery.`,
-        `After receiving it, say RECURSIVE_PARENT_OK_${id} and call subagent_done.`,
+        `After receiving it, say RECURSIVE_PARENT_OK_${id}. Do not call subagent_done.`,
       ].join("\n");
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Recursive-${id}"`,
-        `  autoExit: false`,
+        `  autoExit: true`,
         `  extensionMode: "explicit"`,
         `  extensions: ""`,
         `  task: ${JSON.stringify(parentTask)}`,

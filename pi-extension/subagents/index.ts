@@ -204,7 +204,7 @@ const SubagentParams = Type.Object({
   autoExit: Type.Optional(
     Type.Boolean({
       description:
-        "Whether this subagent exits automatically after its first completed turn. Set false for recursive orchestrators that must remain alive to receive child results and call subagent_done afterward. Overrides agent frontmatter.",
+        "Whether this subagent exits automatically after a completed turn. Tracked descendants defer shutdown until their results are delivered and processed, so recursive orchestrators can leave this enabled. Overrides agent frontmatter.",
     }),
   ),
   interactive: Type.Optional(
@@ -455,8 +455,8 @@ function resolveEffectiveAutoExit(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  // A per-spawn override supports recursive orchestrators that need to finish
-  // one turn, receive descendant steer messages, and call subagent_done later.
+  // A per-spawn override supports explicitly interactive handoffs. Recursive
+  // orchestrators can keep auto-exit enabled because tracked descendants defer it.
   if (params.autoExit != null) return params.autoExit;
 
   // Named agents otherwise preserve their declared behavior. Bare tool calls

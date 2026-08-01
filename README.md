@@ -251,7 +251,7 @@ subagent({
   task: "Import memories, then delegate validation to another worker",
   extensionMode: "explicit",
   extensions: "./tools/memory-import.ts",
-  autoExit: false,
+  autoExit: true,
 });
 
 // Inside that child: extensionMode and extensions inherit independently.
@@ -268,7 +268,7 @@ subagent({ name: "Memory validator", task: "Validate the imported memories" });
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
-| `autoExit`             | boolean | agent setting or `true` for bare spawns | Override automatic exit after the first completed turn. Set `false` for Pi-backed recursive orchestrators that must receive child results before calling `subagent_done`. Claude-backed spawns reject this override. |
+| `autoExit`             | boolean | agent setting or `true` for bare spawns | Host-controlled exit after a completed turn. Tracked descendants defer exit until their results are delivered and processed, so recursive orchestrators can keep this enabled. Claude-backed spawns reject this override. |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of effective `autoExit`. |
 | `model`                | string  | configured or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | parent level   | Pi thinking level (`off` through `max`); omit to inherit the parent                                |
@@ -440,7 +440,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Host-controlled shutdown after a completed turn — no `subagent_done` call needed. Active tracked descendants defer shutdown until their results are delivered and processed. Recommended for autonomous agents and recursive orchestrators; not for interactive agents (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -470,17 +470,19 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+When set to `true`, the host shuts the agent session down after a completed turn — no explicit `subagent_done` call is needed.
 
 **Behavior:**
 
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
+- A normal final response or terminal provider error closes the session on `agent_end`; an aborted turn remains open
+- Active tracked descendants defer shutdown, including when the orchestrator finishes an intermediate turn while waiting for their results
+- Each terminal descendant is removed before its result is steered back; after the orchestrator processes the final result, its next completed turn exits automatically
 - The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**
 
 - ✅ Autonomous agents (scout, worker, reviewer) that run to completion
+- ✅ Recursive orchestrators that wait for tracked descendant result delivery
 - ❌ Interactive agents (planner, iterate) where the user drives the session
 
 ```yaml
@@ -490,17 +492,17 @@ auto-exit: true
 ---
 ```
 
-The `subagent` tool's `autoExit` parameter overrides frontmatter for one Pi-backed spawn. Claude-backed spawns reject this parameter because their stop hook does not support deferred completion. Recursive Pi orchestrators should remain open while descendants run, then call `subagent_done` only after processing their results:
+The `subagent` tool's `autoExit` parameter overrides frontmatter for one Pi-backed spawn. Claude-backed spawns reject this parameter because their stop hook does not support deferred completion. Recursive Pi orchestrators should keep auto-exit enabled; the host defers it while descendants remain tracked and completes the orchestrator after its final result-processing turn:
 
 ```typescript
 subagent({
   name: "Recursive orchestrator",
-  autoExit: false,
-  task: "Spawn a child, process its delivered result, then call subagent_done.",
+  autoExit: true,
+  task: "Spawn a child, wait for its delivered result, process it, and summarize the outcome.",
 });
 ```
 
-`subagent_done` fails closed while the caller still has tracked direct descendants. Tracking uses a parent-owned registry for each child registration and a distinct child-owned registry for that child's descendants; the child registry is stable across resume and isolated from sibling sessions. A terminal child is removed before its result is delivered, so the recursive parent can process the pushed result and complete without polling.
+`subagent_done` remains available for non-auto-exit sessions and fails closed while the caller still has tracked direct descendants. Tracking uses a parent-owned registry for each child registration and a distinct child-owned registry for that child's descendants; the child registry is stable across resume and isolated from sibling sessions. A terminal child is removed before its result is delivered, so the recursive parent can process the pushed result and complete without polling.
 
 ### `interactive`
 

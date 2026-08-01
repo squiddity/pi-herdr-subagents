@@ -19,6 +19,17 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
+export function shouldDeferAutoExitForDescendants(descendantsFile: string | undefined): boolean {
+  if (!descendantsFile) return false;
+  try {
+    return readTrackedDescendants(descendantsFile).length > 0;
+  } catch {
+    // Fail closed: an unreadable registry must never let an orchestrator
+    // abandon descendants whose terminal delivery cannot be ruled out.
+    return true;
+  }
+}
+
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
   messages: any[] | undefined,
@@ -98,6 +109,7 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const descendantsFile = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -198,7 +210,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const shouldExit = autoExit
+      && !shouldDeferAutoExitForDescendants(descendantsFile)
+      && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -334,7 +348,6 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      const descendantsFile = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
       if (descendantsFile) {
         const descendants = readTrackedDescendants(descendantsFile);
         if (descendants.length > 0) {

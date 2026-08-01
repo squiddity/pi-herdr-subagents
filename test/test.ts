@@ -62,9 +62,11 @@ import {
   childDescendantRegistryPath,
   parentDescendantRegistryPath,
   registerDescendant,
+  unregisterDescendant,
 } from "../pi-extension/subagents/descendant-registry.ts";
 import subagentDoneExtension, {
   shouldMarkUserTookOver,
+  shouldDeferAutoExitForDescendants,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildCompletionSidecar,
@@ -1548,6 +1550,54 @@ describe("subagent-done.ts", () => {
       } finally {
         restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previous);
       }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defers auto-exit until tracked descendants have delivered", () => {
+    const dir = createTestDir();
+    const descendantsFile = join(dir, "descendants.json");
+    const sessionFile = join(dir, "orchestrator.jsonl");
+    registerDescendant(descendantsFile, { id: "child-1", name: "Child one", state: "active" });
+    const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+    const previousDescendants = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+    const previousSession = process.env.PI_SUBAGENT_SESSION;
+    process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+    process.env.PI_SUBAGENT_DESCENDANTS_FILE = descendantsFile;
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    try {
+      const { api, eventHandlers } = createMockExtensionApi();
+      subagentDoneExtension(api as any);
+      const agentEnd = eventHandlers.get("agent_end")?.[0];
+      assert.ok(agentEnd);
+      let shutdowns = 0;
+      const ctx = { shutdown() { shutdowns++; } };
+      const event = { messages: [{ role: "assistant", stopReason: "stop" }] };
+
+      agentEnd(event, ctx);
+      assert.equal(shutdowns, 0);
+      assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+      unregisterDescendant(descendantsFile, "child-1");
+      agentEnd(event, ctx);
+      assert.equal(shutdowns, 1);
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+      restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previousDescendants);
+      restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the descendant registry is unreadable", () => {
+    const dir = createTestDir();
+    try {
+      const descendantsFile = join(dir, "descendants.json");
+      writeFileSync(descendantsFile, "not json");
+      assert.equal(shouldDeferAutoExitForDescendants(descendantsFile), true);
+      assert.equal(shouldDeferAutoExitForDescendants(undefined), false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
