@@ -17,6 +17,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
   cleanupSubagentsForShutdown,
+  prepareSubagentWatcher,
   selectCompletionApi,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
@@ -2632,6 +2633,24 @@ describe("tool registration", () => {
 });
 
 describe("subagent parent lifecycle", () => {
+  it("gives launch and resume completion watchers independent abort lifetimes", () => {
+    const running: { abortController?: AbortController } = {};
+    const signal = prepareSubagentWatcher(running as any);
+
+    assert.ok(running.abortController);
+    assert.equal(signal, running.abortController.signal);
+    assert.equal(signal.aborted, false);
+
+    const source = readFileSync(
+      fileURLToPath(new URL("../pi-extension/subagents/index.ts", import.meta.url)),
+      "utf8",
+    );
+    const wiredWatchers = source.match(
+      /watchSubagent\(running, prepareSubagentWatcher\(running\)\)/g,
+    ) ?? [];
+    assert.equal(wiredWatchers.length, 2, "both launch and resume must initialize their completion watcher");
+  });
+
   it("preserves active subagents during extension reload", () => {
     const abortController = new AbortController();
     const agents = new Map([["child", {

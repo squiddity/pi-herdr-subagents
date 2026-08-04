@@ -843,6 +843,19 @@ export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
   return current ?? previous;
 }
 
+/**
+ * Give a background completion watcher its own lifetime. Tool-call abort
+ * signals end when execute() returns, so launch and resume must never reuse
+ * them or rely on duplicated local controller setup.
+ */
+export function prepareSubagentWatcher(
+  running: Pick<RunningSubagent, "abortController">,
+): AbortSignal {
+  const controller = new AbortController();
+  running.abortController = controller;
+  return controller.signal;
+}
+
 function unregisterRunningDescendant(running: RunningSubagent): void {
   runtime.waitingTimeoutStates.delete(running.id);
   running.waitingTimeoutState = undefined;
@@ -2433,18 +2446,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const running = await launchSubagent(params, ctx, parentThinking);
 
-        // Create a separate AbortController for the watcher
-        // (the tool's signal completes when we return)
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
         // Start widget refresh and status supervision when the first agent launches
         startWidgetRefresh();
         startStatusRefresh(pi);
         if (running.waitTimeout != null) startWaitingTimeoutRefresh(pi);
 
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        // Fire-and-forget: start watching with a lifetime independent of this tool call.
+        watchSubagent(running, prepareSubagentWatcher(running))
           .then((result) => {
             refreshCompletionActivity(running);
             if (!shouldDeliverSubagentCompletion(running)) {
@@ -3054,10 +3062,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
         if (running.waitTimeout != null) startWaitingTimeoutRefresh(pi);
 
-        // Fire-and-forget watcher        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
-        watchSubagent(running, watcherAbort.signal)
+        // Fire-and-forget: resumed sessions need the same independent watcher lifetime.
+        watchSubagent(running, prepareSubagentWatcher(running))
           .then((result) => {
             refreshCompletionActivity(running);
             if (!shouldDeliverSubagentCompletion(running)) {
