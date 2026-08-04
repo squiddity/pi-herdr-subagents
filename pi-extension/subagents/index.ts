@@ -64,7 +64,31 @@ import {
   parentDescendantRegistryPath,
   registerDescendant,
   unregisterDescendant,
+  readTrackedDescendants,
 } from "./descendant-registry.ts";
+import {
+  atomicWriteJson,
+  completionControlFileExists,
+  createCompletionControlRequest,
+  isSafelyWaitingForCompletion,
+  readCompletionControlRequest,
+  type CompletionControlRequest,
+} from "./interrupt-control.ts";
+import {
+  WAIT_TIMEOUT_MAX_SECONDS,
+  WAIT_TIMEOUT_MAX_SNOOZE_SECONDS,
+  advanceWaitingTimeout,
+  formatWaitingTimeoutNotification,
+  normalizeSnoozeSeconds,
+  cancelWaitingSnooze,
+  getWaitingGeneration,
+  markWaitingTimeoutNotificationSent,
+  scheduleWaitingSnooze,
+  sameWaitingGeneration,
+  type WaitTimeoutSetting,
+  type WaitingTimeoutMessagePolicy,
+  type WaitingTimeoutState,
+} from "./waiting-timeout.ts";
 
 import {
   findLastAssistantMessage,
@@ -118,6 +142,7 @@ const CURRENT_EXTENSION_ENTRIES = {
 // children; the reloaded module adopts the shared registry for status/interrupts.
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
+const WAIT_TIMEOUT_INTERVAL_KEY = Symbol.for("pi-subagents/wait-timeout-interval");
 const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
 
 {
@@ -130,6 +155,11 @@ const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
   if (prevStatusInterval) {
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+  }
+  const prevWaitTimeoutInterval = (globalThis as any)[WAIT_TIMEOUT_INTERVAL_KEY];
+  if (prevWaitTimeoutInterval) {
+    clearInterval(prevWaitTimeoutInterval);
+    (globalThis as any)[WAIT_TIMEOUT_INTERVAL_KEY] = null;
   }
 }
 
@@ -213,6 +243,22 @@ const SubagentParams = Type.Object({
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
     }),
   ),
+  waitTimeout: Type.Optional(
+    Type.Union([
+      Type.Integer({ minimum: 1, maximum: WAIT_TIMEOUT_MAX_SECONDS }),
+      Type.Literal("immediate"),
+      Type.Literal("off"),
+    ], {
+      description:
+        `One-shot parent notification for a manual waiting child: use "immediate" on the next parent observation, 1-${WAIT_TIMEOUT_MAX_SECONDS} for delayed seconds, or "off" to disable. Omit to use named-profile configuration or the disabled default.`,
+    }),
+  ),
+  waitTimeoutMessage: Type.Optional(
+    Type.Union([Type.Literal("none"), Type.Literal("preview"), Type.Literal("full")], {
+      description:
+        "Latest final assistant message policy for waiting-timeout notifications: none, preview (default), or full (both strictly capped).",
+    }),
+  ),
   resumeSessionId: Type.Optional(
     Type.String({
       description:
@@ -232,6 +278,8 @@ interface AgentDefaults {
   spawning?: boolean;
   autoExit?: boolean;
   interactive?: boolean;
+  waitTimeout?: WaitTimeoutSetting;
+  waitTimeoutMessage?: WaitingTimeoutMessagePolicy;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
   cwd?: string;
@@ -258,6 +306,7 @@ interface ListedAgentDefinition extends AgentDefinition {
 const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
+  "subagent_snooze",
   "subagents_list",
   "subagent_resume",
 ]);
@@ -307,6 +356,21 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
 }
 
+function parseWaitTimeout(value: string | undefined): WaitTimeoutSetting | undefined {
+  if (value == null) return undefined;
+  if (value.toLowerCase() === "off") return null;
+  if (value.toLowerCase() === "immediate") return "immediate";
+  if (!/^\d+$/.test(value)) return undefined;
+  const seconds = Number(value);
+  return Number.isInteger(seconds) && seconds >= 1 && seconds <= WAIT_TIMEOUT_MAX_SECONDS
+    ? seconds
+    : undefined;
+}
+
+function parseWaitTimeoutMessage(value: string | undefined): WaitingTimeoutMessagePolicy | undefined {
+  return value === "none" || value === "preview" || value === "full" ? value : undefined;
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -348,6 +412,8 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
+    waitTimeout: parseWaitTimeout(getFrontmatterValue(frontmatter, "wait-timeout")),
+    waitTimeoutMessage: parseWaitTimeoutMessage(getFrontmatterValue(frontmatter, "wait-timeout-message")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
@@ -474,6 +540,22 @@ function resolveEffectiveInteractive(
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !resolveEffectiveAutoExit(params, agentDefs);
+}
+
+function resolveEffectiveWaitTimeout(
+  params: Static<typeof SubagentParams> | { waitTimeout?: WaitTimeoutSetting | "off" },
+  agentDefs: AgentDefaults | null,
+): WaitTimeoutSetting {
+  const requested = params.waitTimeout;
+  if (requested !== undefined) return requested === "off" ? null : requested;
+  return agentDefs?.waitTimeout ?? null;
+}
+
+function resolveEffectiveWaitTimeoutMessage(
+  params: Static<typeof SubagentParams> | { waitTimeoutMessage?: WaitingTimeoutMessagePolicy },
+  agentDefs: AgentDefaults | null,
+): WaitingTimeoutMessagePolicy {
+  return params.waitTimeoutMessage ?? agentDefs?.waitTimeoutMessage ?? "preview";
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -694,23 +776,40 @@ interface RunningSubagent {
   toolProfile?: ToolProfileEvidence;
   /** Registry owned by this process's parent; contains this running child. */
   parentDescendantRegistryPath?: string;
+  /** Registry owned by this child; completion must fail closed while it is nonempty. */
+  childDescendantRegistryPath?: string;
+  /** Host-to-child control sidecar used to complete a safely waiting manual child. */
+  controlFile?: string;
+  autoExit?: boolean;
+  /** Explicitly configured one-shot waiting notification; null means disabled. */
+  waitTimeout?: WaitTimeoutSetting;
+  waitTimeoutMessage?: WaitingTimeoutMessagePolicy;
+  /** Current generation-bound timeout/snooze state. */
+  waitingTimeoutState?: WaitingTimeoutState;
 }
 
 interface SubagentRuntime {
   runningSubagents: Map<string, RunningSubagent>;
+  /** Generation-bound timeout state survives extension /reload. */
+  waitingTimeoutStates: Map<string, WaitingTimeoutState>;
   pi?: ExtensionAPI;
   latestCtx?: ExtensionContext;
   modelCatalog?: string;
 }
 
 function createSubagentRuntime(): SubagentRuntime {
-  return { runningSubagents: new Map<string, RunningSubagent>() };
+  return {
+    runningSubagents: new Map<string, RunningSubagent>(),
+    waitingTimeoutStates: new Map<string, WaitingTimeoutState>(),
+  };
 }
 
 /** Runtime state preserved across /reload. */
 const runtime: SubagentRuntime =
   (globalThis as any)[RUNTIME_KEY] ??
   ((globalThis as any)[RUNTIME_KEY] = createSubagentRuntime());
+// Runtimes created by older module generations may not have the new map.
+if (!runtime.waitingTimeoutStates) runtime.waitingTimeoutStates = new Map();
 const runningSubagents = runtime.runningSubagents;
 
 export function shouldPreserveSubagentsOnShutdown(reason: unknown): boolean {
@@ -745,6 +844,8 @@ export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
 }
 
 function unregisterRunningDescendant(running: RunningSubagent): void {
+  runtime.waitingTimeoutStates.delete(running.id);
+  running.waitingTimeoutState = undefined;
   if (!running.parentDescendantRegistryPath) return;
   try {
     unregisterDescendant(running.parentDescendantRegistryPath, running.id);
@@ -761,6 +862,8 @@ let widgetInterval: ReturnType<typeof setInterval> | null = null;
 
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
+/** Interval timer for explicit one-shot waiting notifications. */
+let waitTimeoutInterval: ReturnType<typeof setInterval> | null = null;
 
 function formatElapsedMMSS(startTime: number, endTime = Date.now()): string {
   const seconds = Math.floor((endTime - startTime) / 1000);
@@ -1094,8 +1197,82 @@ function requestSubagentInterrupt(
   }
 }
 
+function requestWaitingSubagentCompletion(
+  running: RunningSubagent,
+  requestedAt = Date.now(),
+): { ok: true; request: CompletionControlRequest; repeated: boolean } | { error: string } {
+  const activity = running.activity;
+  if (!activity || !isSafelyWaitingForCompletion(activity)) {
+    return {
+      error:
+        `Subagent "${running.name}" is not safely waiting with a completed, content-bearing final answer. ` +
+        "No completion request was sent.",
+    };
+  }
+  if (!running.controlFile) {
+    return { error: `Subagent "${running.name}" has no completion control channel.` };
+  }
+
+  const summary = existsSync(running.sessionFile)
+    ? findLastAssistantMessage(getNewEntries(running.sessionFile, 0))
+    : null;
+  if (!summary?.trim()) {
+    return {
+      error:
+        `Subagent "${running.name}" reported a completed turn but its session has no usable final assistant text. ` +
+        "No completion request was sent.",
+    };
+  }
+
+  if (running.childDescendantRegistryPath) {
+    try {
+      const descendants = readTrackedDescendants(running.childDescendantRegistryPath);
+      if (descendants.length > 0) {
+        const names = descendants.map((child) => `${child.name} [${child.id}]`).join(", ");
+        return {
+          error:
+            `Cannot complete subagent "${running.name}" while tracked descendants remain: ${names}`,
+        };
+      }
+    } catch (error) {
+      return {
+        error:
+          `Cannot safely complete subagent "${running.name}": its descendant registry is unreadable ` +
+          `(${error instanceof Error ? error.message : String(error)}).`,
+      };
+    }
+  }
+
+  if (completionControlFileExists(running.controlFile)) {
+    const existing = readCompletionControlRequest(running.controlFile, running.id);
+    if (
+      existing.ok &&
+      existing.request.expectedActivitySequence === activity.sequence &&
+      existing.request.expectedTurnIndex === (activity.turnIndex ?? null)
+    ) {
+      return { ok: true, request: existing.request, repeated: true };
+    }
+  }
+
+  const request = createCompletionControlRequest({
+    runningChildId: running.id,
+    activity,
+    requestedAt,
+  });
+  try {
+    atomicWriteJson(running.controlFile, request);
+  } catch (error) {
+    return {
+      error:
+        `Failed to request completion from subagent "${running.name}": ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  return { ok: true, request, repeated: false };
+}
+
 function handleSubagentInterrupt(
-  params: { id?: string; name?: string },
+  params: { id?: string; name?: string; finish?: boolean },
   interruptPaneKey: (surface: string) => void = interruptPane,
 ) {
   const resolved = resolveInterruptTarget(params);
@@ -1112,7 +1289,7 @@ function handleSubagentInterrupt(
       content: [{
         type: "text" as const,
         text:
-          "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
+          "Subagent interruption is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
       }],
       details: { error: "claude interrupt unsupported", id: running.id, name: running.name },
     };
@@ -1120,6 +1297,47 @@ function handleSubagentInterrupt(
 
   const now = Date.now();
   observeRunningSubagent(running, now);
+  const projection = projectLifecycle(ensureLifecycle(running), now);
+
+  // Default behavior is completion-aware: a child that already finished a
+  // normal turn should return that answer instead of receiving a useless Escape.
+  if (params.finish !== false && running.activity?.phase === "waiting") {
+    const completion = requestWaitingSubagentCompletion(running, now);
+    if ("error" in completion) {
+      return {
+        content: [{ type: "text" as const, text: completion.error }],
+        details: { error: completion.error, id: running.id, name: running.name },
+      };
+    }
+    updateWidget();
+    const text = completion.repeated
+      ? `Completion is already requested for waiting subagent "${running.name}".`
+      : `Completion requested for waiting subagent "${running.name}". Its final answer will be delivered automatically.`;
+    return {
+      content: [{ type: "text" as const, text }],
+      details: {
+        id: running.id,
+        name: running.name,
+        status: "completion_requested",
+        requestId: completion.request.requestId,
+        repeated: completion.repeated,
+      },
+    };
+  }
+
+  if (
+    params.finish !== false &&
+    projection.kind !== "active" &&
+    projection.kind !== "blocked"
+  ) {
+    const error = projection.kind === "interrupted"
+      ? `Subagent "${running.name}" already has an interrupted turn and is still open. Send it another prompt, or call subagent_interrupt again after it reaches a safe waiting state.`
+      : `Subagent "${running.name}" is ${projection.kind}; no active turn can be interrupted and no safe completed answer is available.`;
+    return {
+      content: [{ type: "text" as const, text: error }],
+      details: { error, id: running.id, name: running.name, status: projection.kind },
+    };
+  }
 
   const interruption = requestSubagentInterrupt(running, interruptPaneKey);
   if ("error" in interruption) {
@@ -1132,10 +1350,233 @@ function handleSubagentInterrupt(
   running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
   updateWidget();
 
+  const suffix = params.finish === false
+    ? " The session remains open."
+    : " The active turn is being cancelled; no result will be fabricated from an aborted turn.";
   return {
-    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` }],
+    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}".${suffix}` }],
     details: { id: running.id, name: running.name, status: "interrupt_requested" },
   };
+}
+
+function handleSubagentSnooze(params: {
+  id?: string;
+  name?: string;
+  seconds?: number;
+  cancel?: boolean;
+}): any {
+  const resolved = resolveInterruptTarget(params);
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: resolved.error }],
+      details: { error: resolved.error },
+    };
+  }
+
+  const running = resolved.running;
+  if (running.cli === "claude") {
+    const error = "Waiting snooze is supported only for Pi-backed subagents.";
+    return { content: [{ type: "text" as const, text: error }], details: { error, id: running.id, name: running.name } };
+  }
+
+  observeRunningSubagent(running, Date.now());
+  const generation = getWaitingGeneration(running.activity ?? null);
+  if (!generation) {
+    const error = `Subagent "${running.name}" is not on a current waiting generation; no snooze was scheduled.`;
+    return { content: [{ type: "text" as const, text: error }], details: { error, id: running.id, name: running.name } };
+  }
+
+  const existing = runtime.waitingTimeoutStates.get(running.id);
+  if (params.cancel) {
+    const cancelled = cancelWaitingSnooze(existing, generation);
+    runtime.waitingTimeoutStates.set(running.id, cancelled.state);
+    running.waitingTimeoutState = cancelled.state;
+    const text = cancelled.cancelled
+      ? `Cancelled the pending waiting notification snooze for subagent "${running.name}".`
+      : `No pending waiting notification snooze exists for subagent "${running.name}".`;
+    return {
+      content: [{ type: "text" as const, text }],
+      details: { id: running.id, name: running.name, status: cancelled.cancelled ? "snooze_cancelled" : "no_snooze" },
+    };
+  }
+
+  const seconds = normalizeSnoozeSeconds(params.seconds);
+  if (seconds == null) {
+    const error = `Snooze seconds must be an integer from 1 to ${WAIT_TIMEOUT_MAX_SNOOZE_SECONDS}.`;
+    return { content: [{ type: "text" as const, text: error }], details: { error, id: running.id, name: running.name } };
+  }
+
+  const state = scheduleWaitingSnooze(existing, generation, Date.now(), seconds);
+  runtime.waitingTimeoutStates.set(running.id, state);
+  running.waitingTimeoutState = state;
+  if (runtime.pi) startWaitingTimeoutRefresh(runtime.pi);
+  return {
+    content: [{
+      type: "text" as const,
+      text: `Scheduled one additional waiting notification for subagent "${running.name}" in ${seconds}s. It will be replaced by a newer snooze and invalidated if the child resumes or completes.`,
+    }],
+    details: {
+      id: running.id,
+      name: running.name,
+      status: "snoozed",
+      seconds,
+      activitySequence: generation.activitySequence,
+      turnIndex: generation.turnIndex,
+    },
+  };
+}
+
+function getWaitingTimeoutLatestMessage(running: RunningSubagent): string | null {
+  if (
+    running.waitTimeoutMessage === "none" ||
+    running.activity?.lastTurnHasAssistantText !== true
+  ) return null;
+  try {
+    if (!existsSync(running.sessionFile)) return null;
+    return findLastAssistantMessage(getNewEntries(running.sessionFile, 0));
+  } catch {
+    // Session text is presentation-only. A malformed or deleted transcript
+    // must never prevent the generation notification from being retried.
+    return null;
+  }
+}
+
+function getTrackedDescendantStatus(
+  running: RunningSubagent,
+): { count: number; readable: boolean } {
+  if (!running.childDescendantRegistryPath) return { count: 0, readable: true };
+  try {
+    return {
+      count: readTrackedDescendants(running.childDescendantRegistryPath).length,
+      readable: true,
+    };
+  } catch {
+    return { count: 0, readable: false };
+  }
+}
+
+function runWaitingTimeoutTick(pi: ExtensionAPI, observedAt = Date.now()): void {
+  for (const running of runningSubagents.values()) {
+    const existing = runtime.waitingTimeoutStates.get(running.id);
+    // Existing state must keep being observed even after its one-shot deadline
+    // fires so resumed activity can invalidate and remove the generation.
+    if (running.waitTimeout == null && !existing) continue;
+
+    observeRunningSubagent(running, observedAt);
+    const activitySnapshot = running.activityRead?.ok ? running.activity ?? null : null;
+    const advanced = advanceWaitingTimeout(
+      existing,
+      activitySnapshot,
+      running.waitTimeout ?? null,
+      observedAt,
+    );
+    if (!advanced.state.generation) {
+      runtime.waitingTimeoutStates.delete(running.id);
+      running.waitingTimeoutState = undefined;
+      continue;
+    }
+    runtime.waitingTimeoutStates.set(running.id, advanced.state);
+    running.waitingTimeoutState = advanced.state;
+    if (!advanced.due) continue;
+
+    // Re-read the sidecar immediately before constructing/sending the steer.
+    // A completion, new input, or activity event racing the interval must win.
+    observeRunningSubagent(running, Date.now());
+    const currentGeneration = getWaitingGeneration(
+      running.activityRead?.ok ? running.activity ?? null : null,
+    );
+    if (!sameWaitingGeneration(advanced.state.generation, currentGeneration)) {
+      const rearmed = advanceWaitingTimeout(
+        advanced.state,
+        running.activityRead?.ok ? running.activity ?? null : null,
+        running.waitTimeout ?? null,
+        Date.now(),
+      );
+      if (rearmed.state.generation) {
+        runtime.waitingTimeoutStates.set(running.id, rearmed.state);
+        running.waitingTimeoutState = rearmed.state;
+      } else {
+        runtime.waitingTimeoutStates.delete(running.id);
+        running.waitingTimeoutState = undefined;
+      }
+      continue;
+    }
+
+    const generation = advanced.state.generation;
+    const latestMessage = getWaitingTimeoutLatestMessage(running);
+    const descendantStatus = getTrackedDescendantStatus(running);
+    const safelyCompletable =
+      running.activity != null &&
+      isSafelyWaitingForCompletion(running.activity) &&
+      latestMessage != null &&
+      descendantStatus.readable &&
+      descendantStatus.count === 0;
+    const content = formatWaitingTimeoutNotification({
+      name: normalizeStatusName(running.name),
+      elapsedSeconds: (Date.now() - generation.waitingSince) / 1000,
+      generation,
+      messagePolicy: running.waitTimeoutMessage ?? "preview",
+      latestMessage,
+      descendantCount: descendantStatus.count,
+      descendantRegistryReadable: descendantStatus.readable,
+      safelyCompletable,
+    });
+    const api = selectCompletionApi(pi, runtime.pi);
+    try {
+      api.sendMessage(
+        {
+          customType: "subagent_waiting_timeout",
+          content,
+          display: true,
+          details: {
+            id: running.id,
+            name: running.name,
+            runningChildId: running.id,
+            activitySequence: generation.activitySequence,
+            turnIndex: generation.turnIndex,
+            notificationKind: advanced.due,
+            messagePolicy: running.waitTimeoutMessage ?? "preview",
+            finalMessageAvailable: latestMessage != null,
+            safelyCompletable,
+            descendantCount: descendantStatus.count,
+            descendantRegistryReadable: descendantStatus.readable,
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    } catch {
+      // The state remains unacknowledged so a transient parent send failure is
+      // retryable. No Escape or completion request is sent from this path.
+      continue;
+    }
+
+    const acknowledged = markWaitingTimeoutNotificationSent(
+      advanced.state,
+      generation,
+      advanced.due,
+    );
+    runtime.waitingTimeoutStates.set(running.id, acknowledged);
+    running.waitingTimeoutState = acknowledged;
+  }
+}
+
+function startWaitingTimeoutRefresh(pi: ExtensionAPI): void {
+  if (waitTimeoutInterval) return;
+  waitTimeoutInterval = setInterval(() => {
+    const hasSupervisedWaiting = Array.from(runningSubagents.values()).some(
+      (running) => running.waitTimeout != null || runtime.waitingTimeoutStates.has(running.id),
+    );
+    if (!hasSupervisedWaiting) {
+      if (waitTimeoutInterval) {
+        clearInterval(waitTimeoutInterval);
+        waitTimeoutInterval = null;
+        (globalThis as any)[WAIT_TIMEOUT_INTERVAL_KEY] = null;
+      }
+      return;
+    }
+    runWaitingTimeoutTick(pi);
+  }, 1000);
+  (globalThis as any)[WAIT_TIMEOUT_INTERVAL_KEY] = waitTimeoutInterval;
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
@@ -1239,12 +1680,20 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveAutoExit,
   resolveEffectiveInteractive,
+  resolveEffectiveWaitTimeout,
+  resolveEffectiveWaitTimeoutMessage,
+  parseWaitTimeout,
+  parseWaitTimeoutMessage,
+  handleSubagentSnooze,
+  runWaitingTimeoutTick,
+  waitingTimeoutStates: runtime.waitingTimeoutStates,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   observeRunningSubagent,
   resolveDenyTools,
   resolveInterruptTarget,
   requestSubagentInterrupt,
+  requestWaitingSubagentCompletion,
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
@@ -1309,6 +1758,8 @@ async function launchSubagent(
   const effectiveThinking = runtimePlan.thinking;
   const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const effectiveWaitTimeout = resolveEffectiveWaitTimeout(params, agentDefs);
+  const effectiveWaitTimeoutMessage = resolveEffectiveWaitTimeoutMessage(params, agentDefs);
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1356,6 +1807,8 @@ async function launchSubagent(
       inheritedExtensionEntries: [...extensionRuntime.extensions],
       configRoot: effectiveConfigRoot,
       allowedChildAgents: agentDefs?.allowedChildAgents ?? null,
+      waitTimeout: effectiveWaitTimeout,
+      waitTimeoutMessage: effectiveWaitTimeoutMessage,
     };
     // A host-only HMAC binds every executable/config field to this exact
     // session path. The public attestation is also written into child session
@@ -1406,6 +1859,7 @@ async function launchSubagent(
   }
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
+  const controlFile = join(artifactDir, "subagent-control", `${id}.json`);
   mkdirSync(dirname(activityFile), { recursive: true });
   const parentRegistryPath = parentDescendantRegistryPath();
   const childRegistryPath = childDescendantRegistryPath(artifactDir, subagentSessionFile);
@@ -1565,6 +2019,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
+  envParts.push(`PI_SUBAGENT_CONTROL_FILE=${shellQuote(controlFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
@@ -1643,6 +2098,11 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    controlFile,
+    autoExit: effectiveAutoExit,
+    waitTimeout: effectiveWaitTimeout,
+    waitTimeoutMessage: effectiveWaitTimeoutMessage,
+    childDescendantRegistryPath: childRegistryPath,
     interactive: effectiveInteractive,
     runtimePlan,
     launchProfile,
@@ -1862,6 +2322,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (runningSubagents.size > 0) {
       startWidgetRefresh();
       startStatusRefresh(pi);
+      if (Array.from(runningSubagents.values()).some((running) => running.waitTimeout != null || runtime.waitingTimeoutStates.has(running.id))) {
+        startWaitingTimeoutRefresh(pi);
+      }
       updateWidget();
     }
   });
@@ -1878,8 +2341,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
+    if (waitTimeoutInterval) {
+      clearInterval(waitTimeoutInterval);
+      waitTimeoutInterval = null;
+      (globalThis as any)[WAIT_TIMEOUT_INTERVAL_KEY] = null;
+    }
 
-    cleanupSubagentsForShutdown((event as any).reason, runningSubagents);
+    const shutdownReason = (event as any).reason;
+    cleanupSubagentsForShutdown(shutdownReason, runningSubagents);
+    if (!shouldPreserveSubagentsOnShutdown(shutdownReason)) {
+      runtime.waitingTimeoutStates.clear();
+    }
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1969,6 +2441,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Start widget refresh and status supervision when the first agent launches
         startWidgetRefresh();
         startStatusRefresh(pi);
+        if (running.waitTimeout != null) startWaitingTimeoutRefresh(pi);
 
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
@@ -2156,16 +2629,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Finish or interrupt a currently running Pi-backed subagent. " +
+        "If the child is safely waiting after a completed turn, its existing final answer is accepted and delivered automatically. " +
+        "If the child is active, Escape cancels only that turn and the session remains open; aborted output is not treated as a result. " +
+        "Set finish=false for explicit turn-only Escape behavior.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Finish or interrupt a currently running Pi-backed subagent. " +
+        "A safely waiting child is completed and its final answer is delivered automatically. " +
+        "An active child receives Escape and remains open; set finish=false for turn-only behavior.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        finish: Type.Optional(Type.Boolean({
+          description: "When true (default), safely complete a waiting child; false always sends turn-only Escape.",
+        })),
       }),
 
       async execute(_toolCallId, params) {
@@ -2186,6 +2663,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderResult(result, _opts, theme) {
         const details = result.details as any;
+        if (details?.status === "completion_requested") {
+          return new Text(
+            theme.fg("success", "✓") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
+              theme.fg("dim", details.repeated ? " — completion already requested" : " — completion requested"),
+            0,
+            0,
+          );
+        }
         if (details?.status === "interrupt_requested") {
           return new Text(
             theme.fg("accent", "▸") +
@@ -2197,6 +2684,65 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagent_snooze tool ──
+  if (shouldRegister("subagent_snooze"))
+    pi.registerTool({
+      name: "subagent_snooze",
+      label: "Snooze Subagent",
+      description:
+        "Schedule one additional parent notification for the exact current waiting generation of a subagent. " +
+        "The call returns immediately, replaces an existing snooze, never sends Escape, and is invalidated by new activity or completion. " +
+        "Set cancel=true to cancel a pending snooze.",
+      promptSnippet:
+        "Schedule one additional notification for a currently waiting subagent. " +
+        "Use bounded seconds; set cancel=true to cancel the pending snooze.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        seconds: Type.Optional(Type.Integer({
+          minimum: 1,
+          maximum: WAIT_TIMEOUT_MAX_SNOOZE_SECONDS,
+          description: `Seconds until one additional notification (1-${WAIT_TIMEOUT_MAX_SNOOZE_SECONDS}).`,
+        })),
+        cancel: Type.Optional(Type.Boolean({ description: "Cancel the current generation's pending snooze." })),
+      }),
+
+      async execute(_toolCallId, params) {
+        return handleSubagentSnooze(params);
+      },
+
+      renderCall(args, theme) {
+        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
+        const action = args.cancel ? "cancel snooze" : `${args.seconds ?? "?"}s`;
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(target)) +
+            theme.fg("dim", ` — ${action}`),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.status === "snoozed") {
+          return new Text(
+            theme.fg("accent", "◷") + " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
+              theme.fg("dim", ` — one notification in ${details.seconds}s`),
+            0,
+            0,
+          );
+        }
+        if (details?.status === "snooze_cancelled") {
+          return new Text(theme.fg("success", "✓") + " " + theme.fg("dim", "waiting snooze cancelled"), 0, 0);
+        }
         const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
@@ -2400,6 +2946,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
+        const controlFile = join(artifactDir, "subagent-control", `${id}.json`);
         mkdirSync(dirname(activityFile), { recursive: true });
         const parentRegistryPath = parentDescendantRegistryPath();
         const childRegistryPath = childDescendantRegistryPath(artifactDir, sessionPath);
@@ -2432,6 +2979,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_CONTROL_FILE=${shellQuote(controlFile)}`);
         // Always set false/null states explicitly so pane/base environments
         // cannot leak identity or auto-exit behavior into the resumed child.
         if (!profileLaunch) resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellQuote("")}`);
@@ -2467,6 +3015,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           throw error;
         }
 
+        // Preserve the effective timeout from a verified launch profile. Older
+        // profiles have no field, so fall back to the named profile; external
+        // unverified sessions remain disabled by default.
+        const resumedAgentDefs = launchProfile?.agent ? loadAgentDefaults(launchProfile.agent) : null;
+        const resumedWaitTimeout = launchProfile?.waitTimeout !== undefined
+          ? launchProfile.waitTimeout
+          : resolveEffectiveWaitTimeout({}, resumedAgentDefs);
+        const resumedWaitTimeoutMessage = launchProfile?.waitTimeoutMessage
+          ?? resolveEffectiveWaitTimeoutMessage({}, resumedAgentDefs);
+
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
@@ -2477,6 +3035,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
+          controlFile,
+          autoExit,
+          waitTimeout: resumedWaitTimeout,
+          waitTimeoutMessage: resumedWaitTimeoutMessage,
+          childDescendantRegistryPath: childRegistryPath,
           interactive,
           agent: launchProfile?.agent ?? undefined,
           runtimePlan: launchProfile ? runtimePlanFromLaunchProfile(launchProfile) : undefined,
@@ -2489,9 +3052,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         runningSubagents.set(id, running);
         startWidgetRefresh();
         startStatusRefresh(pi);
+        if (running.waitTimeout != null) startWaitingTimeoutRefresh(pi);
 
-        // Fire-and-forget watcher
-        const watcherAbort = new AbortController();
+        // Fire-and-forget watcher        const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
         watchSubagent(running, watcherAbort.signal)
@@ -2755,6 +3318,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
         }
 
+        const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
+        box.addChild(new Text(contentLines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      },
+    };
+  });
+
+  // ── subagent_waiting_timeout message renderer ──
+  pi.registerMessageRenderer("subagent_waiting_timeout", (message, options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+    return {
+      render(width: number): string[] {
+        const content = typeof message.content === "string" ? message.content : "";
+        const lineWidth = Math.max(0, width - 6);
+        const contentLines = [
+          `${theme.fg("accent", "◷")} ${theme.fg("toolTitle", theme.bold(details.name ?? "subagent"))} ${theme.fg("dim", "— still waiting")}`,
+        ];
+        if (options.expanded) {
+          contentLines.push(...content.split("\n").map((line) => truncateToWidth(line, lineWidth)));
+        } else {
+          const first = content.split("\n").find((line) => line.trim()) ?? "";
+          contentLines.push(theme.fg("dim", truncateToWidth(first, lineWidth)));
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        }
         const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];

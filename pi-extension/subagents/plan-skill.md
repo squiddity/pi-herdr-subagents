@@ -91,6 +91,8 @@ subagent({
   name: "💬 Planner",
   agent: "planner",
   interactive: true,
+  waitTimeout: "immediate",
+  waitTimeoutMessage: "preview",
   task: `Plan: [what the user wants to build]
 
 Scout context:
@@ -103,7 +105,22 @@ Create todos tagged with: <name>`,
 
 **The user works with the planner.** It will clarify requirements lightly (1-2 rounds of questions, not a deep spec session), propose approaches, validate the design, run a premortem, write the plan, and create todos with mandatory code examples.
 
-When done, the user presses Ctrl+D and the plan + todos are returned to the main session.
+The planner profile uses `wait-timeout: immediate` with a bounded final-message preview. On the next parent supervision observation after each new waiting generation, the parent receives exactly one steer. This does **not** interrupt or close the planner. The parent can:
+
+```typescript
+// Accept a safe, completed final answer and close the planner.
+subagent_interrupt({ id: "<running-child-id>" });
+
+// Ask for one additional notification later; this is nonblocking and nonperiodic.
+subagent_snooze({ id: "<running-child-id>", seconds: 60 });
+
+// Cancel the pending snooze for the current waiting generation.
+subagent_snooze({ id: "<running-child-id>", cancel: true });
+```
+
+Completion and snooze requests are bound to the exact child/activity-sequence/turn generation. New activity invalidates old requests. If the steer says the turn is unsafe to accept (for example aborted, errored, or blocked by descendants), do not treat its preview as a completed result.
+
+Ctrl+D remains the **user-driven** way to exit a planner pane. `subagent_interrupt` on a safely waiting planner is the **parent-driven** completion path. Use `finish: false` only to send turn-level Escape to active work; it does not finish a waiting session.
 
 ### The planner may spawn its own specialists
 

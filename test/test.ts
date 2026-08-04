@@ -70,7 +70,15 @@ import subagentDoneExtension, {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildCompletionSidecar,
+  getWaitingTurnEvidence,
 } from "../pi-extension/subagents/subagent-done.ts";
+import {
+  atomicWriteJson,
+  createCompletionControlRequest,
+  isSafelyWaitingForCompletion,
+  readCompletionControlRequest,
+  requestMatchesWaitingTurn,
+} from "../pi-extension/subagents/interrupt-control.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
   createLifecycle,
@@ -1118,6 +1126,71 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loads and resolves named-profile waiting timeout policy with spawn precedence", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "waiting-profile-test-agent",
+        [
+          "name: waiting-profile-test-agent",
+          "auto-exit: false",
+          "interactive: true",
+          "wait-timeout: 45",
+          "wait-timeout-message: full",
+        ].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "waiting-off-test-agent",
+        [
+          "name: waiting-off-test-agent",
+          "wait-timeout: off",
+        ].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "waiting-immediate-test-agent",
+        [
+          "name: waiting-immediate-test-agent",
+          "wait-timeout: immediate",
+          "wait-timeout-message: preview",
+        ].join("\n"),
+      );
+
+      const configured = testApi.loadAgentDefaults("waiting-profile-test-agent");
+      assert.equal(configured?.waitTimeout, 45);
+      assert.equal(configured?.waitTimeoutMessage, "full");
+      assert.equal(testApi.resolveEffectiveWaitTimeout({ name: "A", task: "T" }, configured), 45);
+      assert.equal(testApi.resolveEffectiveWaitTimeoutMessage({ name: "A", task: "T" }, configured), "full");
+      assert.equal(testApi.resolveEffectiveWaitTimeout(
+        { name: "A", task: "T", waitTimeout: 10 },
+        configured,
+      ), 10);
+      assert.equal(testApi.resolveEffectiveWaitTimeout(
+        { name: "A", task: "T", waitTimeout: "immediate" },
+        configured,
+      ), "immediate");
+      assert.equal(testApi.resolveEffectiveWaitTimeout(
+        { name: "A", task: "T", waitTimeout: "off" },
+        configured,
+      ), null);
+      assert.equal(testApi.resolveEffectiveWaitTimeoutMessage(
+        { name: "A", task: "T", waitTimeoutMessage: "none" },
+        configured,
+      ), "none");
+
+      const immediate = testApi.loadAgentDefaults("waiting-immediate-test-agent");
+      assert.equal(immediate?.waitTimeout, "immediate");
+      assert.equal(testApi.resolveEffectiveWaitTimeout({ name: "A", task: "T" }, immediate), "immediate");
+
+      const disabled = testApi.loadAgentDefaults("waiting-off-test-agent");
+      assert.equal(disabled?.waitTimeout, null);
+      assert.equal(testApi.resolveEffectiveWaitTimeout({ name: "A", task: "T" }, disabled), null);
+      assert.equal(testApi.resolveEffectiveWaitTimeout({ name: "A", task: "T" }, null), null);
+      assert.equal(testApi.resolveEffectiveWaitTimeoutMessage({ name: "A", task: "T" }, null), "preview");
+    });
+  });
+
   it("leaves interactive undefined when not set in frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1281,6 +1354,10 @@ describe("subagent discovery", () => {
         `${name} should preserve its interaction mode`,
       );
     }
+
+    const planner = testApi.loadAgentDefaults("planner");
+    assert.equal(planner?.waitTimeout, "immediate");
+    assert.equal(planner?.waitTimeoutMessage, "preview");
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1735,6 +1812,177 @@ describe("subagent-done.ts", () => {
         errorMessage: "provider failed",
         stopReason: "error",
       });
+    });
+  });
+
+  it("accepts a generation-bound parent request and publishes normal completion", async () => {
+    const previous = {
+      id: process.env.PI_SUBAGENT_ID,
+      session: process.env.PI_SUBAGENT_SESSION,
+      activity: process.env.PI_SUBAGENT_ACTIVITY_FILE,
+      control: process.env.PI_SUBAGENT_CONTROL_FILE,
+      descendants: process.env.PI_SUBAGENT_DESCENDANTS_FILE,
+      autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+    };
+
+    const dir = createTestDir();
+    const sessionFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+    const activityFile = getSubagentActivityFile(dir, "child-control");
+    const controlFile = join(dir, "control", "child-control.json");
+    process.env.PI_SUBAGENT_ID = "child-control";
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+    process.env.PI_SUBAGENT_CONTROL_FILE = controlFile;
+    delete process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+    delete process.env.PI_SUBAGENT_AUTO_EXIT;
+
+    const { api, eventHandlers } = createMockExtensionApi();
+    let shutdowns = 0;
+    const ctx = {
+      ui: { setWidget() {} },
+      sessionManager: { appendCustomEntry() {} },
+      shutdown() {
+        shutdowns += 1;
+        for (const handler of eventHandlers.get("session_shutdown") ?? []) {
+          handler({ reason: "quit" }, ctx);
+        }
+      },
+    } as any;
+
+    try {
+      subagentDoneExtension(api);
+      for (const handler of eventHandlers.get("session_start") ?? []) handler({}, ctx);
+      for (const handler of eventHandlers.get("turn_start") ?? []) handler({ turnIndex: 1 }, ctx);
+      for (const handler of eventHandlers.get("agent_start") ?? []) handler({}, ctx);
+      for (const handler of eventHandlers.get("agent_end") ?? []) {
+        handler({
+          messages: [{
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "Useful final answer." }],
+          }],
+        }, ctx);
+      }
+
+      const activity = readSubagentActivityFile(activityFile, "child-control");
+      assert.ok(activity.ok);
+      const request = createCompletionControlRequest({
+        runningChildId: "child-control",
+        activity: activity.activity,
+        requestId: "parent-request",
+      });
+      atomicWriteJson(controlFile, request);
+
+      const deadline = Date.now() + 1_000;
+      while (!existsSync(`${sessionFile}.exit`) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(shutdowns, 1);
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+        type: "done",
+        runningChildId: "child-control",
+        requestId: "parent-request",
+      });
+    } finally {
+      for (const handler of eventHandlers.get("session_shutdown") ?? []) {
+        handler({ reason: "quit" }, ctx);
+      }
+      restoreEnvVar("PI_SUBAGENT_ID", previous.id);
+      restoreEnvVar("PI_SUBAGENT_SESSION", previous.session);
+      restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", previous.activity);
+      restoreEnvVar("PI_SUBAGENT_CONTROL_FILE", previous.control);
+      restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previous.descendants);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previous.autoExit);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("interrupt completion control", () => {
+  function waitingActivity(overrides: Record<string, unknown> = {}) {
+    return {
+      version: 1 as const,
+      runningChildId: "child-1",
+      createdAt: 1_000,
+      updatedAt: 2_000,
+      sequence: 12,
+      latestEvent: "agent_end" as const,
+      phase: "waiting" as const,
+      usage: undefined as any,
+      usageByModel: [],
+      agentActive: false,
+      turnActive: false,
+      providerActive: false,
+      toolActive: false,
+      turnIndex: 3,
+      waitingSince: 2_000,
+      lastTurnOutcome: "completed" as const,
+      lastTurnHasAssistantText: true,
+      ...overrides,
+    };
+  }
+
+  it("classifies only a normal content-bearing idle turn as safely completable", () => {
+    assert.equal(isSafelyWaitingForCompletion(waitingActivity()), true);
+    for (const overrides of [
+      { phase: "active", agentActive: true },
+      { providerActive: true },
+      { toolActive: true },
+      { lastTurnOutcome: "aborted" },
+      { lastTurnOutcome: "error" },
+      { lastTurnHasAssistantText: false },
+    ]) {
+      assert.equal(isSafelyWaitingForCompletion(waitingActivity(overrides) as any), false);
+    }
+  });
+
+  it("extracts privacy-preserving evidence from the latest assistant turn", () => {
+    assert.deepEqual(getWaitingTurnEvidence([
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "finished" }] },
+    ], 3), { outcome: "completed", hasAssistantText: true, turnIndex: 3 });
+    assert.deepEqual(getWaitingTurnEvidence([
+      { role: "assistant", stopReason: "aborted", content: [{ type: "text", text: "partial" }] },
+    ], 4), { outcome: "aborted", hasAssistantText: true, turnIndex: 4 });
+  });
+
+  it("accepts an exact waiting generation and rejects stale or aborted generations", () => {
+    const activity = waitingActivity();
+    const request = createCompletionControlRequest({
+      runningChildId: "child-1",
+      activity: activity as any,
+      requestedAt: 3_000,
+      requestId: "request-1",
+    });
+    assert.equal(requestMatchesWaitingTurn(request, activity as any, {
+      outcome: "completed",
+      hasAssistantText: true,
+      turnIndex: 3,
+    }), true);
+    assert.equal(requestMatchesWaitingTurn(request, waitingActivity({ sequence: 13 }) as any, {
+      outcome: "completed",
+      hasAssistantText: true,
+      turnIndex: 3,
+    }), false);
+    assert.equal(requestMatchesWaitingTurn(request, activity as any, {
+      outcome: "aborted",
+      hasAssistantText: true,
+      turnIndex: 3,
+    }), false);
+  });
+
+  it("atomically round-trips and identity-checks completion requests", () => {
+    withTempDir((dir) => {
+      const file = join(dir, "control", "child.json");
+      const activity = waitingActivity();
+      const request = createCompletionControlRequest({
+        runningChildId: "child-1",
+        activity: activity as any,
+        requestedAt: 3_000,
+        requestId: "request-1",
+      });
+      atomicWriteJson(file, request);
+      assert.deepEqual(readCompletionControlRequest(file, "child-1"), { ok: true, request });
+      assert.equal(readCompletionControlRequest(file, "other").reason, "wrong-id");
     });
   });
 });
@@ -2275,12 +2523,14 @@ describe("tool registration", () => {
     }
   });
 
-  it("expands spawning false to deny subagent interruption", () => {
+  it("expands spawning false to deny every subagent lifecycle tool", () => {
     const testApi = (subagentsModule as any).__test__;
     const denied = testApi.resolveDenyTools({ spawning: false });
 
     assert.equal(denied.has("subagent"), true);
     assert.equal(denied.has("subagent_interrupt"), true);
+    assert.equal(denied.has("subagent_snooze"), true);
+    assert.equal(denied.has("subagents_list"), true);
     assert.equal(denied.has("subagent_resume"), true);
   });
 
@@ -2637,11 +2887,13 @@ describe("subagent activity snapshots", () => {
 
       recorder.sessionStart();
       currentNow = 3_000;
-      recorder.agentEndWaiting();
+      recorder.agentEndWaiting({ outcome: "completed", hasAssistantText: true });
       let read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "waiting");
       assert.equal(read.activity.waitingSince, 3_000);
+      assert.equal(read.activity.lastTurnOutcome, "completed");
+      assert.equal(read.activity.lastTurnHasAssistantText, true);
 
       currentNow = 4_000;
       recorder.subagentDone();
@@ -2666,6 +2918,8 @@ describe("subagent activity snapshots", () => {
         { actualTools: "read" },
         { actualTools: ["read", "read"] },
         { deniedTools: ["bad tool"] },
+        { lastTurnOutcome: "cancelled" },
+        { lastTurnHasAssistantText: "yes" },
       ];
 
       for (const [index, overrides] of cases.entries()) {
@@ -2963,6 +3217,85 @@ describe("subagent interruption", () => {
     });
   });
 
+  it("completes a safely waiting manual child without sending Escape", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    withTempDir((dir) => {
+      const sessionFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, {
+        ...ASSISTANT_MSG,
+        message: {
+          ...ASSISTANT_MSG.message,
+          stopReason: "stop",
+          content: [{ type: "text", text: "Useful final answer." }],
+        },
+      }]);
+      const activityFile = getSubagentActivityFile(dir, "a1");
+      const controlFile = join(dir, "control", "a1.json");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "a1",
+        activityFile,
+        now: () => 10_000,
+      });
+      recorder.sessionStart();
+      recorder.turnStart(1);
+      recorder.agentEndWaiting({ outcome: "completed", hasAssistantText: true });
+      let escapes = 0;
+
+      try {
+        runningMap.set("a1", makeRunning({ sessionFile, activityFile, controlFile }));
+        const first = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+          escapes += 1;
+        });
+        const second = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+          escapes += 1;
+        });
+
+        assert.equal(escapes, 0);
+        assert.equal(first.details.status, "completion_requested");
+        assert.equal(first.details.repeated, false);
+        assert.equal(second.details.status, "completion_requested");
+        assert.equal(second.details.repeated, true);
+        assert.equal(second.details.requestId, first.details.requestId);
+        const request = readCompletionControlRequest(controlFile, "a1");
+        assert.ok(request.ok);
+        assert.equal(request.request.expectedActivitySequence, runningMap.get("a1").activity.sequence);
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
+  it("refuses to complete an aborted waiting turn even when it contains partial text", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    withTempDir((dir) => {
+      const sessionFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const activityFile = getSubagentActivityFile(dir, "a1");
+      const controlFile = join(dir, "control", "a1.json");
+      const recorder = createSubagentActivityRecorder({ runningChildId: "a1", activityFile });
+      recorder.sessionStart();
+      recorder.turnStart(1);
+      recorder.agentEndWaiting({ outcome: "aborted", hasAssistantText: true });
+      let escapes = 0;
+
+      try {
+        runningMap.set("a1", makeRunning({ sessionFile, activityFile, controlFile }));
+        const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+          escapes += 1;
+        });
+        assert.equal(escapes, 0);
+        assert.match(result.content[0].text, /not safely waiting/);
+        assert.equal(existsSync(controlFile), false);
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
   it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -3001,7 +3334,7 @@ describe("subagent interruption", () => {
       }));
 
       assert.equal(sentSurface, "pane-1");
-      assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
+      assert.match(result.content[0].text, /Interrupt requested for subagent "Worker"/);
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
       const projection = projectLifecycle(runningMap.get("a1").lifecycle, 20_000);
       assert.equal(projection.kind, "interrupted");
@@ -3011,7 +3344,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("sends Escape again for repeated interrupt requests", () => {
+  it("sends Escape again for repeated explicit turn-only interrupt requests", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     const surfaces: string[] = [];
@@ -3020,10 +3353,10 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning());
 
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      testApi.handleSubagentInterrupt({ name: "Worker", finish: false }, (surface: string) => {
         surfaces.push(surface);
       });
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      testApi.handleSubagentInterrupt({ name: "Worker", finish: false }, (surface: string) => {
         surfaces.push(surface);
       });
 
@@ -3100,6 +3433,305 @@ describe("subagent interruption", () => {
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: subagent_resume/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+});
+
+describe("waiting-timeout parent supervision", () => {
+  function makeWaitingRunning(params: {
+    dir: string;
+    outcome?: "completed" | "aborted" | "error";
+    hasText?: boolean;
+    waitTimeout?: number | "immediate" | null;
+  }) {
+    const id = "waiting-child";
+    const sessionFile = createSessionFile(params.dir, [
+      SESSION_HEADER,
+      MODEL_CHANGE,
+      USER_MSG,
+      {
+        ...ASSISTANT_MSG,
+        message: {
+          ...ASSISTANT_MSG.message,
+          stopReason: params.outcome === "aborted" ? "aborted" : "stop",
+          content: params.hasText === false ? [] : [{ type: "text", text: "Final timeout answer." }],
+        },
+      },
+    ]);
+    const activityFile = getSubagentActivityFile(params.dir, id);
+    const recorder = createSubagentActivityRecorder({
+      runningChildId: id,
+      activityFile,
+      now: () => 1_000,
+    });
+    recorder.sessionStart();
+    recorder.turnStart(2);
+    recorder.agentEndWaiting({
+      outcome: params.outcome ?? "completed",
+      hasAssistantText: params.hasText !== false,
+    });
+    return {
+      id,
+      name: "Waiting Worker",
+      task: "",
+      surface: "waiting-pane",
+      startTime: 0,
+      sessionFile,
+      activityFile,
+      interactive: true,
+      waitTimeout: params.waitTimeout === undefined ? 1 : params.waitTimeout,
+      waitTimeoutMessage: "preview",
+      lifecycle: createLifecycle(0),
+    };
+  }
+
+  it("emits one generation-bound steer with the available final answer", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const timeoutStates = testApi.waitingTimeoutStates as Map<string, any>;
+    runningMap.clear();
+    timeoutStates.clear();
+
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir });
+      const { api, sentMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      try {
+        runningMap.set(running.id, running);
+        testApi.runWaitingTimeoutTick(api, 2_000);
+        testApi.runWaitingTimeoutTick(api, 3_000);
+
+        assert.equal(sentMessages.length, 1);
+        assert.equal(sentMessages[0].message.customType, "subagent_waiting_timeout");
+        assert.match(sentMessages[0].message.content, /Final timeout answer/);
+        assert.match(sentMessages[0].message.content, /subagent_interrupt/);
+        assert.equal(sentMessages[0].message.details.activitySequence, running.activity.sequence);
+        assert.equal(sentMessages[0].message.details.turnIndex, 2);
+        assert.equal(sentMessages[0].message.details.safelyCompletable, true);
+        assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+      } finally {
+        runningMap.clear();
+        timeoutStates.clear();
+      }
+    });
+  });
+
+  it("notifies immediate mode on first observation and suppresses duplicates", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const timeoutStates = testApi.waitingTimeoutStates as Map<string, any>;
+    runningMap.clear();
+    timeoutStates.clear();
+
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir, waitTimeout: "immediate" });
+      const { api } = createMockExtensionApi();
+      const sent: any[] = [];
+      (api as any).sendMessage = (message: any) => { sent.push(message); };
+      (subagentsModule as any).default(api);
+      try {
+        runningMap.set(running.id, running);
+        testApi.runWaitingTimeoutTick(api, 1_000);
+        testApi.runWaitingTimeoutTick(api, 1_001);
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].details.notificationKind, "initial");
+        assert.equal(timeoutStates.get(running.id).notified, true);
+      } finally {
+        runningMap.clear();
+        timeoutStates.clear();
+      }
+    });
+  });
+
+  it("retries immediate delivery after a failed send and rearms on a new generation", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const timeoutStates = testApi.waitingTimeoutStates as Map<string, any>;
+    runningMap.clear();
+    timeoutStates.clear();
+
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir, waitTimeout: "immediate" });
+      const { api } = createMockExtensionApi();
+      const sent: any[] = [];
+      let attempts = 0;
+      (api as any).sendMessage = (message: any) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("transient send failure");
+        sent.push(message);
+      };
+      (subagentsModule as any).default(api);
+      try {
+        runningMap.set(running.id, running);
+        testApi.runWaitingTimeoutTick(api, 1_000);
+        testApi.runWaitingTimeoutTick(api, 1_001);
+        assert.equal(attempts, 2);
+        assert.equal(sent.length, 1);
+
+        const recorder = createSubagentActivityRecorder({
+          runningChildId: running.id,
+          activityFile: running.activityFile,
+          now: () => 2_000,
+        });
+        recorder.input();
+        testApi.runWaitingTimeoutTick(api, 2_000);
+        assert.equal(timeoutStates.has(running.id), false);
+
+        recorder.turnStart(4);
+        recorder.agentEndWaiting({ outcome: "completed", hasAssistantText: true });
+        testApi.runWaitingTimeoutTick(api, 2_001);
+        assert.equal(sent.length, 2);
+        assert.equal(sent[1].details.notificationKind, "initial");
+        assert.equal(sent[1].details.turnIndex, 4);
+        assert.notEqual(sent[1].details.turnIndex, sent[0].details.turnIndex);
+      } finally {
+        runningMap.clear();
+        timeoutStates.clear();
+      }
+    });
+  });
+
+  it("suppresses immediate notifications while the child is active", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const timeoutStates = testApi.waitingTimeoutStates as Map<string, any>;
+    runningMap.clear();
+    timeoutStates.clear();
+
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir, waitTimeout: "immediate" });
+      const { api } = createMockExtensionApi();
+      const sent: any[] = [];
+      (api as any).sendMessage = (message: any) => { sent.push(message); };
+      (subagentsModule as any).default(api);
+      try {
+        runningMap.set(running.id, running);
+        const recorder = createSubagentActivityRecorder({
+          runningChildId: running.id,
+          activityFile: running.activityFile,
+          now: () => 2_000,
+        });
+        recorder.input();
+        testApi.runWaitingTimeoutTick(api, 2_000);
+        assert.equal(sent.length, 0);
+        assert.equal(timeoutStates.has(running.id), false);
+      } finally {
+        runningMap.clear();
+        timeoutStates.clear();
+      }
+    });
+  });
+
+  it("retries failed steer delivery and accurately labels an aborted waiting turn", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const timeoutStates = testApi.waitingTimeoutStates as Map<string, any>;
+    runningMap.clear();
+    timeoutStates.clear();
+
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir, outcome: "aborted" });
+      const { api } = createMockExtensionApi();
+      const sent: any[] = [];
+      let attempts = 0;
+      (api as any).sendMessage = (message: any) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("transient send failure");
+        sent.push(message);
+      };
+      (subagentsModule as any).default(api);
+      try {
+        runningMap.set(running.id, running);
+        testApi.runWaitingTimeoutTick(api, 2_000);
+        testApi.runWaitingTimeoutTick(api, 2_001);
+
+        assert.equal(attempts, 2);
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].details.safelyCompletable, false);
+        assert.doesNotMatch(sent[0].content, /You may accept the waiting answer/);
+        assert.match(sent[0].content, /not currently safe to accept/);
+      } finally {
+        runningMap.clear();
+        timeoutStates.clear();
+      }
+    });
+  });
+
+  it("coexists with immediate delivery without creating a periodic reminder", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const timeoutStates = testApi.waitingTimeoutStates as Map<string, any>;
+    runningMap.clear();
+    timeoutStates.clear();
+
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir, waitTimeout: "immediate" });
+      const { api } = createMockExtensionApi();
+      const sent: any[] = [];
+      (api as any).sendMessage = (message: any) => { sent.push(message); };
+      (subagentsModule as any).default(api);
+      try {
+        runningMap.set(running.id, running);
+        testApi.runWaitingTimeoutTick(api, 1_000);
+        assert.equal(sent.length, 1);
+
+        const result = withMockedNow(2_000, () =>
+          testApi.handleSubagentSnooze({ id: running.id, seconds: 5 }),
+        );
+        assert.equal(result.details.status, "snoozed");
+        testApi.runWaitingTimeoutTick(api, 6_999);
+        assert.equal(sent.length, 1);
+        testApi.runWaitingTimeoutTick(api, 7_000);
+        testApi.runWaitingTimeoutTick(api, 8_000);
+        assert.equal(sent.length, 2);
+        assert.equal(sent[1].details.notificationKind, "snooze");
+      } finally {
+        runningMap.clear();
+        timeoutStates.clear();
+      }
+    });
+  });
+
+  it("snoozes exactly once for the current generation and invalidates on new activity", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const timeoutStates = testApi.waitingTimeoutStates as Map<string, any>;
+    runningMap.clear();
+    timeoutStates.clear();
+
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir });
+      running.waitTimeout = null;
+      const { api } = createMockExtensionApi();
+      const sent: any[] = [];
+      (api as any).sendMessage = (message: any) => { sent.push(message); };
+      (subagentsModule as any).default(api);
+      try {
+        runningMap.set(running.id, running);
+        const result = withMockedNow(2_000, () =>
+          testApi.handleSubagentSnooze({ id: running.id, seconds: 5 }),
+        );
+        assert.equal(result.details.status, "snoozed");
+        testApi.runWaitingTimeoutTick(api, 6_999);
+        testApi.runWaitingTimeoutTick(api, 7_000);
+        testApi.runWaitingTimeoutTick(api, 8_000);
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].details.notificationKind, "snooze");
+
+        const recorder = createSubagentActivityRecorder({
+          runningChildId: running.id,
+          activityFile: running.activityFile,
+          now: () => 9_000,
+        });
+        recorder.sessionStart();
+        recorder.input();
+        testApi.runWaitingTimeoutTick(api, 100_000);
+        assert.equal(sent.length, 1);
+        assert.equal(timeoutStates.has(running.id), false);
+      } finally {
+        runningMap.clear();
+        timeoutStates.clear();
+      }
+    });
   });
 });
 

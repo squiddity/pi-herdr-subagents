@@ -46,6 +46,8 @@ const unsignedProfile: UnsignedSubagentLaunchProfile = {
   inheritedExtensionEntries: ["/workspace/tools/example-child-extension.ts"],
   configRoot: "/workspace/child/.pi/agent",
   allowedChildAgents: ["child-reader"],
+  waitTimeout: 120,
+  waitTimeoutMessage: "preview",
 };
 
 function fixture(dir: string): {
@@ -87,6 +89,39 @@ describe("Pi subagent launch profiles", () => {
     });
   });
 
+  it("round-trips immediate waiting policy and rejects tampering", () => {
+    withTempDir((dir) => {
+      const session = join(dir, "immediate-child.jsonl");
+      const key = Buffer.alloc(32, 0x5a);
+      const profile = attestLaunchProfile(
+        session,
+        { ...unsignedProfile, waitTimeout: "immediate" },
+        key,
+        "cd".repeat(32),
+      );
+      writeFileSync(session, `${JSON.stringify({ type: "session", version: 3, id: "session-1" })}\n`);
+      appendFileSync(session, `${JSON.stringify({
+        type: "custom",
+        id: "attestation-immediate",
+        parentId: null,
+        customType: PROFILE_ATTESTATION_CUSTOM_TYPE,
+        data: { version: 1, ...profile.attestation },
+      })}\n`);
+      const path = writeLaunchProfile(session, profile);
+      const verified = readLaunchProfile(session, key);
+      assert.equal(verified.status, "verified");
+      if (verified.status === "verified") {
+        assert.equal(verified.profile.waitTimeout, "immediate");
+        assert.equal(buildResumeProfileLaunch(session, verified.profile).env.PI_SUBAGENT_PROFILE_ATTESTATION.includes(profile.attestation.signature), true);
+      }
+
+      writeFileSync(path, `${JSON.stringify({ ...profile, waitTimeout: 30 })}\n`);
+      const tampered = readLaunchProfile(session, key);
+      assert.equal(tampered.status, "untrusted");
+      if (tampered.status === "untrusted") assert.match(tampered.error, /signature/);
+    });
+  });
+
   it("rejects schema-valid arbitrary and tampered executable/config fields", () => {
     withTempDir((dir) => {
       const { session, key, profile, path } = fixture(dir);
@@ -95,6 +130,9 @@ describe("Pi subagent launch profiles", () => {
         { ...profile, configRoot: "/tmp/attacker-config" },
         { ...profile, cwd: "/tmp/attacker-cwd" },
         { ...profile, allowedChildAgents: ["reviewer"] },
+        { ...profile, waitTimeout: 121 },
+        { ...profile, waitTimeout: "immediate" as const },
+        { ...profile, waitTimeoutMessage: "full" as const },
       ];
       for (const mutation of mutations) {
         writeFileSync(path, `${JSON.stringify(mutation)}\n`);
@@ -106,6 +144,20 @@ describe("Pi subagent launch profiles", () => {
       const attackerProfile = attestLaunchProfile(session, unsignedProfile, Buffer.alloc(32, 0x33));
       writeFileSync(path, `${JSON.stringify(attackerProfile)}\n`);
       assert.equal(readLaunchProfile(session, key).status, "untrusted");
+    });
+  });
+
+  it("round-trips and validates an attested immediate waiting policy", () => {
+    withTempDir((dir) => {
+      const session = join(dir, "immediate-child.jsonl");
+      const immediate = attestLaunchProfile(
+        session,
+        { ...unsignedProfile, waitTimeout: "immediate" },
+        Buffer.alloc(32, 0x5a),
+        "cd".repeat(32),
+      );
+      assert.equal(validateLaunchProfile(immediate).waitTimeout, "immediate");
+      assert.equal(validateLaunchProfile(immediate).waitTimeoutMessage, "preview");
     });
   });
 
@@ -145,6 +197,14 @@ describe("Pi subagent launch profiles", () => {
       assert.throws(
         () => validateLaunchProfile({ ...attested, extensionEntries: ["./relative.ts"] }),
         /must be absolute/,
+      );
+      assert.throws(
+        () => validateLaunchProfile({ ...attested, waitTimeout: 0 }),
+        /waitTimeout must be an integer/,
+      );
+      assert.throws(
+        () => validateLaunchProfile({ ...attested, waitTimeoutMessage: "everything" }),
+        /waitTimeoutMessage must be/,
       );
     });
   });
@@ -236,6 +296,8 @@ describe("Pi subagent launch profiles", () => {
       assert.equal(buildResumeProfileLaunch(session, { ...profile, agent: null }).env.PI_SUBAGENT_AGENT, "");
       assert.equal(launch.env.PI_CODING_AGENT_DIR, "/workspace/child/.pi/agent");
       assert.equal(launch.env.PI_DENY_TOOLS, "subagent,subagent_resume");
+      assert.equal(profile.waitTimeout, 120);
+      assert.equal(profile.waitTimeoutMessage, "preview");
       assert.match(launch.env.PI_SUBAGENT_PROFILE_ATTESTATION, /"signature"/);
     });
   });

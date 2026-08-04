@@ -90,6 +90,9 @@ export interface SubagentActivityState {
   actualTools?: string[];
   /** Policy deny names exported by the host for this child. */
   deniedTools?: string[];
+  /** Content-free evidence for safely accepting a parent completion request. */
+  lastTurnOutcome?: "completed" | "aborted" | "error";
+  lastTurnHasAssistantText?: boolean;
 }
 
 export type ActivityReadResult =
@@ -105,7 +108,10 @@ export interface SubagentActivityRecorder {
   input(): void;
   beforeAgentStart(): void;
   agentStart(): void;
-  agentEndWaiting(): void;
+  agentEndWaiting(evidence?: {
+    outcome: "completed" | "aborted" | "error";
+    hasAssistantText: boolean;
+  }): void;
   agentEndDone(): void;
   turnStart(turnIndex?: number): void;
   turnEnd(turnIndex?: number): void;
@@ -183,6 +189,18 @@ function validateOptionalInteger(object: Record<string, unknown>, fieldName: str
 
 function validateBoolean(object: Record<string, unknown>, fieldName: string): string | null {
   return typeof object[fieldName] === "boolean" ? null : `${fieldName} must be a boolean`;
+}
+
+function validateOptionalBoolean(object: Record<string, unknown>, fieldName: string): string | null {
+  const value = object[fieldName];
+  return value == null || typeof value === "boolean" ? null : `${fieldName} must be a boolean when present`;
+}
+
+function validateOptionalTurnOutcome(object: Record<string, unknown>): string | null {
+  const value = object.lastTurnOutcome;
+  return value == null || value === "completed" || value === "aborted" || value === "error"
+    ? null
+    : "lastTurnOutcome is invalid";
 }
 
 function validateOptionalActivityString(object: Record<string, unknown>, fieldName: string): string | null {
@@ -338,6 +356,8 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalActivityString(object, "toolName"),
     validateOptionalToolNames(object, "actualTools"),
     validateOptionalToolNames(object, "deniedTools"),
+    validateOptionalTurnOutcome(object),
+    validateOptionalBoolean(object, "lastTurnHasAssistantText"),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
@@ -710,11 +730,18 @@ export function createSubagentActivityRecorder(params: {
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
-    agentEndWaiting() {
+    agentEndWaiting(evidence) {
       record("agent_end", (current, observedAt) => {
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;
+        if (evidence) {
+          current.lastTurnOutcome = evidence.outcome;
+          current.lastTurnHasAssistantText = evidence.hasAssistantText;
+        } else {
+          delete current.lastTurnOutcome;
+          delete current.lastTurnHasAssistantText;
+        }
       }, "immediate");
     },
     agentEndDone() {

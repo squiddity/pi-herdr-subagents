@@ -73,12 +73,13 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 5 main-session tools + 3 commands, plus 1 subagent-only tool:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_interrupt` | Complete a safely waiting Pi child, or interrupt its active turn                           |
+| `subagent_snooze` | Schedule one additional notification for a waiting generation (nonblocking)                 |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
@@ -270,6 +271,8 @@ subagent({ name: "Memory validator", task: "Validate the imported memories" });
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `autoExit`             | boolean | agent setting or `true` for bare spawns | Host-controlled exit after a completed turn. Tracked descendants defer exit until their results are delivered and processed, so recursive orchestrators can keep this enabled. Claude-backed spawns reject this override. |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of effective `autoExit`. |
+| `waitTimeout`          | `immediate`, integer seconds, or `off` | disabled | Per-spawn override for `wait-timeout`; `immediate` notifies on the next parent observation of a new waiting generation. Precedence is spawn → named profile → disabled. Explicitly configure it for interactive children. |
+| `waitTimeoutMessage`   | `none`, `preview`, or `full` | `preview` | Per-spawn override for `wait-timeout-message`. |
 | `model`                | string  | configured or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | parent level   | Pi thinking level (`off` through `max`); omit to inherit the parent                                |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
@@ -283,17 +286,25 @@ subagent({ name: "Memory validator", task: "Validate the imported memories" });
 
 ## Interrupting a running subagent
 
-Use `subagent_interrupt` to cancel the active turn of a running Pi-backed subagent:
+Use `subagent_interrupt` to finish a manual Pi-backed subagent or cancel its active turn:
 
 ```typescript
 subagent_interrupt({ id: "abcd1234" });
 // or
 subagent_interrupt({ name: "Scout" });
+// force turn-only Escape behavior
+subagent_interrupt({ id: "abcd1234", finish: false });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+The default is completion-aware:
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+- If the child is safely **waiting** after a normal, content-bearing assistant turn, no Escape is sent. The host writes a generation-bound completion request to the child. The child rechecks that it is still on the exact waiting turn, that the turn was not aborted or errored, and that its descendant registry is empty. It then publishes normal completion evidence, shuts down, and the existing final answer is delivered to the parent. This recovers the common `autoExit: false` case where an otherwise well-behaved child produced a final answer but omitted `subagent_done`.
+- If the child is **active** or **blocked**, Escape cancels the in-progress turn. The pane, session, watcher, and running entry remain alive. Aborted or partial output is never promoted to a completed result.
+- Starting, unknown, already-interrupted, unsafe waiting, and terminal states return an explicit status instead of pretending the request succeeded.
+
+Completion requests are identity-, activity-sequence-, and turn-bound. A new prompt or any newer turn makes an old request stale, repeated requests for the same waiting generation are idempotent, and tracked descendants block completion fail-closed. Set `finish: false` when you explicitly want Escape-only behavior regardless of waiting state.
+
+After a turn-only interrupt, the widget labels the child `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open. If the child starts work later, newer observations return it to `active`; normal completion, failure, and `caller_ping` still flow through normally.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
 
@@ -442,6 +453,8 @@ You are a specialized agent that does X...
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Host-controlled shutdown after a completed turn — no `subagent_done` call needed. Active tracked descendants defer shutdown until their results are delivered and processed. Recommended for autonomous agents and recursive orchestrators; not for interactive agents (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
+| `wait-timeout` | `immediate`, integer seconds, or `off` | disabled | One-shot parent notification after a manual child reaches one exact waiting generation. `immediate` notifies on the next parent supervision observation; seconds delay it by 1–604800 seconds; `off` disables it. |
+| `wait-timeout-message` | `none`, `preview`, or `full` | `preview` | Whether to include the latest final assistant message in the timeout steer. Message and notification text are strictly capped. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
@@ -532,13 +545,46 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 
 ---
 
+### `wait-timeout` and `wait-timeout-message`
+
+Waiting timeouts are disabled unless explicitly configured. A named profile can set
+`wait-timeout: immediate`, `wait-timeout: 120` (seconds), or `wait-timeout: off`; a
+`subagent` call can override that with `waitTimeout: "immediate"`, `waitTimeout: 30`,
+or `waitTimeout: "off"`. Precedence is per-spawn override, then named-profile
+frontmatter, then disabled. Interactive profiles do not receive a silent timeout;
+configure one explicitly when a parent reminder is desired.
+
+`immediate` means the parent receives one steer notification on its next supervision
+observation after a new exact waiting generation (child id + activity sequence + turn
+index) is observed. It is not synchronous with the child's `agent_end` event. Numeric
+values wait until the configured deadline. No Escape is sent and the notification does
+not complete the child. `wait-timeout-message: preview` is the recommended default;
+`none`, `preview`, and `full` control inclusion of the latest final assistant message.
+All message and notification text has strict character and UTF-8 byte caps and
+indicates truncation.
+
+Use `subagent_snooze({ id, seconds })` to replace the current generation's pending
+reminder with one additional notification. It returns immediately, never creates a
+periodic reminder, and is invalidated automatically when the child resumes, completes,
+or reaches another activity generation. Use `cancel: true` to cancel a pending snooze.
+The parent can accept a safe completed answer with `subagent_interrupt({ id })`.
+
+```yaml
+---
+name: planner
+interactive: true
+wait-timeout: immediate
+wait-timeout-message: preview
+---
+```
+
 ## Tool Access Control
 
 By default, every sub-agent can spawn further sub-agents. Control this with frontmatter:
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagent_snooze`, `subagents_list`, `subagent_resume`):
 
 ```yaml
 ---
