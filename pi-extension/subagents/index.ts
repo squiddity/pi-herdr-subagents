@@ -42,6 +42,12 @@ import {
   getExtensionRuntimeEnv,
   resolveExtensionRuntime,
 } from "./extension-runtime.ts";
+import {
+  childDescendantRegistryPath,
+  parentDescendantRegistryPath,
+  registerDescendant,
+  unregisterDescendant,
+} from "./descendant-registry.ts";
 
 import {
   findLastAssistantMessage,
@@ -183,6 +189,12 @@ const SubagentParams = Type.Object({
     Type.Boolean({
       description:
         "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+    }),
+  ),
+  autoExit: Type.Optional(
+    Type.Boolean({
+      description:
+        "Whether this subagent exits automatically after a completed turn. Tracked descendants defer shutdown until their results are delivered and processed, so recursive orchestrators can leave this enabled. Overrides agent frontmatter.",
     }),
   ),
   interactive: Type.Optional(
@@ -468,8 +480,12 @@ function resolveEffectiveAutoExit(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  // Named agents preserve their declared behavior. Bare tool calls are
-  // autonomous by default, including full-context forks: `fork` controls
+  // A per-spawn override supports explicitly interactive handoffs. Recursive
+  // orchestrators can keep auto-exit enabled because tracked descendants defer it.
+  if (params.autoExit != null) return params.autoExit;
+
+  // Named agents otherwise preserve their declared behavior. Bare tool calls
+  // are autonomous by default, including full-context forks: `fork` controls
   // context inheritance, not whether the child should remain open. Interactive
   // flows such as /iterate opt out explicitly with `interactive: true`.
   if (agentDefs) return agentDefs.autoExit ?? false;
@@ -665,6 +681,8 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** Registry owned by this process's parent; contains this running child. */
+  parentDescendantRegistryPath?: string;
 }
 
 interface SubagentRuntime {
@@ -714,6 +732,16 @@ export function shouldDeliverSubagentCompletion(
 
 export function selectCompletionApi<T>(previous: T, current: T | undefined): T {
   return current ?? previous;
+}
+
+function unregisterRunningDescendant(running: RunningSubagent): void {
+  if (!running.parentDescendantRegistryPath) return;
+  try {
+    unregisterDescendant(running.parentDescendantRegistryPath, running.id);
+  } catch {
+    // Completion delivery must not be stranded by an already-corrupt host
+    // registry. The child-side done guard remains fail-closed on that input.
+  }
 }
 
 // ── Widget management ──
@@ -1164,6 +1192,17 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+function assertAutoExitOverrideSupported(
+  backend: "pi" | "claude",
+  autoExit: boolean | undefined,
+): void {
+  if (backend === "claude" && autoExit !== undefined) {
+    throw new Error(
+      "autoExit overrides are supported only for Pi-backed subagents; omit autoExit or use a Pi-backed agent.",
+    );
+  }
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1187,6 +1226,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  assertAutoExitOverrideSupported,
   runningSubagents,
   formatElapsed,
 };
@@ -1255,6 +1295,7 @@ async function launchSubagent(
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
   const childBackend = agentDefs?.cli === "claude" ? "claude" : "pi";
+  assertAutoExitOverrideSupported(childBackend, params.autoExit);
   assertExtensionRuntimeSupported(childBackend, params);
   const extensionRuntime = childBackend === "pi"
     ? resolveExtensionRuntime(params, targetCwdForSession)
@@ -1302,6 +1343,8 @@ async function launchSubagent(
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
+  const parentRegistryPath = parentDescendantRegistryPath();
+  const childRegistryPath = childDescendantRegistryPath(artifactDir, subagentSessionFile);
   const { inheritsConversationContext } = launchBehavior;
 
   // Build the task message
@@ -1451,14 +1494,15 @@ async function launchSubagent(
   for (const [name, value] of Object.entries(getExtensionRuntimeEnv(extensionRuntime))) {
     envParts.push(`${name}=${shellQuote(value)}`);
   }
+  envParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
   envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
   }
   envParts.push(`PI_SUBAGENT_ALLOWED_CHILD_AGENTS=${shellQuote(JSON.stringify(agentDefs?.allowedChildAgents ?? null))}`);
-  if (effectiveAutoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
+  // Set false explicitly so a parent auto-exit environment cannot leak into
+  // a child whose per-spawn override disables it.
+  envParts.push(`PI_SUBAGENT_AUTO_EXIT=${shellQuote(effectiveAutoExit ? "1" : "")}`);
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
@@ -1508,15 +1552,38 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  runScriptInPane(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+  if (parentRegistryPath) {
+    registerDescendant(parentRegistryPath, {
+      id,
+      name: params.name,
+      state: "starting",
+    });
+  }
+  try {
+    runScriptInPane(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    });
+  } catch (error) {
+    unregisterRunningDescendant({
+      id,
+      name: params.name,
+      task: params.task,
+      surface,
+      startTime,
+      sessionFile: subagentSessionFile,
+      interactive: effectiveInteractive,
+      runtimePlan,
+      lifecycle: createLifecycle(startTime),
+      parentDescendantRegistryPath: parentRegistryPath,
+    });
+    throw error;
+  }
 
   const running: RunningSubagent = {
     id,
@@ -1530,6 +1597,7 @@ async function launchSubagent(
     activityFile,
     interactive: effectiveInteractive,
     runtimePlan,
+    parentDescendantRegistryPath: parentRegistryPath,
     lifecycle: createLifecycle(startTime),
   };
 
@@ -1853,6 +1921,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            // Remove the terminal child before steering its result so a
+            // recursive parent can process the delivered result and finish.
+            unregisterRunningDescendant(running);
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -1910,6 +1981,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            unregisterRunningDescendant(running);
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -2226,6 +2298,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+        const parentRegistryPath = parentDescendantRegistryPath();
+        const childRegistryPath = childDescendantRegistryPath(artifactDir, params.sessionPath);
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2250,13 +2324,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
         }
+        resumeEnvParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
+        // Set false explicitly so a parent auto-exit environment cannot leak
+        // into a resumed child.
+        resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${shellQuote(autoExit ? "1" : "")}`);
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -2270,16 +2345,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        runScriptInPane(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+        if (parentRegistryPath) {
+          registerDescendant(parentRegistryPath, { id, name, state: "starting" });
+        }
+        try {
+          runScriptInPane(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${params.sessionPath}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          });
+        } catch (error) {
+          unregisterRunningDescendant({
+            id,
+            name,
+            task: params.message ?? "resumed session",
+            surface,
+            startTime,
+            sessionFile: params.sessionPath,
+            interactive,
+            runtimePlan: undefined,
+            lifecycle: createLifecycle(startTime),
+            parentDescendantRegistryPath: parentRegistryPath,
+          });
+          throw error;
+        }
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2293,6 +2387,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           activityFile,
           interactive,
           runtimePlan: undefined,
+          parentDescendantRegistryPath: parentRegistryPath,
           lifecycle: createLifecycle(startTime),
         };
         runningSubagents.set(id, running);
@@ -2305,6 +2400,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            unregisterRunningDescendant(running);
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
@@ -2368,6 +2464,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            unregisterRunningDescendant(running);
             if (!shouldDeliverSubagentCompletion(running)) {
               running.lifecycle = markDelivery(running.lifecycle, "suppressed");
               runningSubagents.delete(running.id);
