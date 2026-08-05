@@ -19,13 +19,6 @@ export interface MessageEntry extends SessionEntry {
 
 export type SeededSubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
-export interface SeededProfileAttestation {
-  version: 1;
-  nonce: string;
-  signature: string;
-  customType: string;
-}
-
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
@@ -57,7 +50,6 @@ export function seedSubagentSessionFile(params: {
   parentSessionFile?: string;
   childSessionFile: string;
   childCwd: string;
-  profileAttestation?: SeededProfileAttestation;
 }): void {
   if (params.mode !== "standalone" && !params.parentSessionFile) {
     throw new Error(`${params.mode} session seeding requires a parent session file`);
@@ -71,28 +63,10 @@ export function seedSubagentSessionFile(params: {
     cwd: params.childCwd,
     ...(params.mode === "standalone" ? {} : { parentSession: params.parentSessionFile }),
   };
-  const attestationEntry = params.profileAttestation
-    ? JSON.stringify({
-        type: "custom",
-        id: randomUUID(),
-        parentId: null,
-        timestamp,
-        customType: params.profileAttestation.customType,
-        data: {
-          version: params.profileAttestation.version,
-          nonce: params.profileAttestation.nonce,
-          signature: params.profileAttestation.signature,
-        },
-      })
-    : null;
   const contentLines = params.mode === "fork"
     ? getForkContentLines(params.parentSessionFile!)
     : [];
-  const lines = [
-    JSON.stringify(header),
-    ...(attestationEntry ? [attestationEntry] : []),
-    ...contentLines,
-  ];
+  const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
   writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");

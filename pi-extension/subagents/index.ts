@@ -44,19 +44,14 @@ import {
   resolveExtensionRuntime,
 } from "./extension-runtime.ts";
 import {
-  attestLaunchProfile,
   buildResumeProfileLaunch,
   compareToolProfile,
-  formatLaunchProfileAttestation,
   formatToolProfileEvidence,
-  loadOrCreateHostAttestationKey,
-  PROFILE_ATTESTATION_CUSTOM_TYPE,
   readLaunchProfile,
   writeLaunchProfile,
   type LaunchProfileReadResult,
   type SubagentLaunchProfile,
   type ToolProfileEvidence,
-  type UnsignedSubagentLaunchProfile,
 } from "./launch-profile.ts";
 import { assertRegularFile, UnsafeFileError } from "./safe-file.ts";
 import {
@@ -708,7 +703,6 @@ function appendHostEvidence(presentation: string, running: RunningSubagent): str
   if (running.runtimePlan?.runtimeMismatch) {
     lines.push(`Runtime warning: ${running.runtimePlan.runtimeMismatch}`);
   }
-  if (running.profileWarning) lines.push(`Host warning: ${running.profileWarning}`);
   if (running.toolProfile) lines.push(formatToolProfileEvidence(running.toolProfile));
   return lines.join("\n\n");
 }
@@ -769,10 +763,9 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
-  /** Validated, prompt-free Pi launch settings; null marks a legacy unverified resume. */
+  /** Validated, prompt-free Pi launch settings for Pi-backed tracked runs. */
   launchProfile?: SubagentLaunchProfile | null;
   launchProfilePath?: string;
-  profileWarning?: string;
   toolProfile?: ToolProfileEvidence;
   /** Registry owned by this process's parent; contains this running child. */
   parentDescendantRegistryPath?: string;
@@ -1665,10 +1658,6 @@ function resolveResumeSessionPath(sessionPath: string): string {
   return resolvePath(sessionPath);
 }
 
-function buildIsolatedResumeArgs(sessionPath: string): string[] {
-  return ["pi", "--session", sessionPath, "--no-extensions"];
-}
-
 function assertAutoExitOverrideSupported(
   backend: "pi" | "claude",
   autoExit: boolean | undefined,
@@ -1711,7 +1700,6 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   resolveResumeSessionPath,
-  buildIsolatedResumeArgs,
   assertAutoExitOverrideSupported,
   runningSubagents,
   formatElapsed,
@@ -1807,7 +1795,7 @@ async function launchSubagent(
   let launchProfile: SubagentLaunchProfile | undefined;
   let launchProfilePath: string | undefined;
   if (childBackend === "pi") {
-    const unsignedProfile: UnsignedSubagentLaunchProfile = {
+    launchProfile = {
       version: 1,
       model: runtimePlan.model,
       thinking: effectiveThinking,
@@ -1823,14 +1811,6 @@ async function launchSubagent(
       waitTimeout: effectiveWaitTimeout,
       waitTimeoutMessage: effectiveWaitTimeoutMessage,
     };
-    // A host-only HMAC binds every executable/config field to this exact
-    // session path. The public attestation is also written into child session
-    // metadata at session_start before a future resume may trust the sidecar.
-    launchProfile = attestLaunchProfile(
-      subagentSessionFile,
-      unsignedProfile,
-      loadOrCreateHostAttestationKey(),
-    );
     launchProfilePath = writeLaunchProfile(subagentSessionFile, launchProfile);
   }
 
@@ -1856,11 +1836,6 @@ async function launchSubagent(
       parentSessionFile: sessionFile,
       childSessionFile: subagentSessionFile,
       childCwd: targetCwdForSession,
-      profileAttestation: {
-        version: launchProfile.version,
-        customType: PROFILE_ATTESTATION_CUSTOM_TYPE,
-        ...launchProfile.attestation,
-      },
     });
   } else if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -2018,11 +1993,6 @@ async function launchSubagent(
   envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
   for (const [name, value] of Object.entries(getExtensionRuntimeEnv(extensionRuntime))) {
     envParts.push(`${name}=${shellQuote(value)}`);
-  }
-  if (launchProfile) {
-    envParts.push(
-      `PI_SUBAGENT_PROFILE_ATTESTATION=${shellQuote(formatLaunchProfileAttestation(launchProfile))}`,
-    );
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
   envParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
@@ -2902,35 +2872,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        let profileRead: LaunchProfileReadResult;
-        try {
-          profileRead = readLaunchProfile(sessionPath, loadOrCreateHostAttestationKey());
-        } catch (error) {
+        const profileRead: LaunchProfileReadResult = readLaunchProfile(sessionPath);
+        if (profileRead.status !== "loaded") {
+          const malformed = profileRead.status === "malformed";
           return {
             content: [{
               type: "text",
-              text: `Refusing to resume: host profile attestation is unavailable: ${error instanceof Error ? error.message : String(error)}`,
-            }],
-            details: { error: "profile attestation unavailable" },
-          };
-        }
-        if (profileRead.status === "malformed" || profileRead.status === "untrusted") {
-          return {
-            content: [{
-              type: "text",
-              text: `Refusing to resume: launch profile is ${profileRead.status}: ${profileRead.error}`,
+              text: malformed
+                ? `Refusing to resume: launch profile is malformed: ${profileRead.error}`
+                : `Refusing to resume: launch profile is missing at ${profileRead.path}. ` +
+                  "Only sessions created with profile preservation are supported; use pi --session for external sessions.",
             }],
             details: {
-              error: profileRead.status === "malformed" ? "invalid launch profile" : "untrusted launch profile",
+              error: malformed ? "invalid launch profile" : "launch profile missing",
               launchProfilePath: profileRead.path,
               profileStatus: profileRead.status,
             },
           };
         }
-        const launchProfile = profileRead.status === "verified" ? profileRead.profile : null;
-        const profileWarning = profileRead.status === "absent"
-          ? `host-authored launch profile is absent at ${profileRead.path}; external/legacy resume disables all extension loading and applies no sidecar config`
-          : undefined;
+        const launchProfile = profileRead.profile;
 
         if (!isTerminalAvailable()) {
           return muxUnavailableResult();
@@ -2942,14 +2902,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const surface = createSubagentPane(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build the profile-controlled resume command. External/legacy sessions
-        // disable all extensions and are explicitly marked unverified.
-        const profileLaunch = launchProfile
-          ? buildResumeProfileLaunch(sessionPath, launchProfile)
-          : null;
-        const parts = profileLaunch
-          ? profileLaunch.args.map((arg) => shellQuote(arg))
-          : buildIsolatedResumeArgs(sessionPath).map((arg) => shellQuote(arg));
+        // Every supported resume reproduces the original runtime policy from
+        // the profile written by the initial Pi-backed launch.
+        const profileLaunch = buildResumeProfileLaunch(sessionPath, launchProfile);
+        const parts = profileLaunch.args.map((arg) => shellQuote(arg));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -2977,11 +2933,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
-        // Build env prefix from the verified profile before adding per-run host
-        // telemetry/lifecycle identifiers.
-        const resumeEnvParts: string[] = profileLaunch
-          ? Object.entries(profileLaunch.env).map(([key, value]) => `${key}=${shellQuote(value)}`)
-          : [];
+        // Build env prefix from the preserved profile before adding per-run
+        // host telemetry/lifecycle identifiers.
+        const resumeEnvParts: string[] = Object.entries(profileLaunch.env)
+          .map(([key, value]) => `${key}=${shellQuote(value)}`);
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
@@ -2989,11 +2944,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
         resumeEnvParts.push(`PI_SUBAGENT_CONTROL_FILE=${shellQuote(controlFile)}`);
         // Always set false/null states explicitly so pane/base environments
-        // cannot leak identity or auto-exit behavior into the resumed child.
-        if (!profileLaunch) resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellQuote("")}`);
+        // cannot leak auto-exit behavior into the resumed child.
         resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${shellQuote(autoExit ? "1" : "")}`);
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
-        const cdPrefix = profileLaunch ? `cd ${shellQuote(profileLaunch.cwd)} && ` : "";
+        const cdPrefix = `cd ${shellQuote(profileLaunch.cwd)} && `;
 
         const command = `${cdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
@@ -3019,13 +2973,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ].join("\n"),
           });
         } catch (error) {
-          unregisterRunningDescendant({ id, name, task: params.message ?? "resumed session", surface, startTime, sessionFile: sessionPath, interactive, runtimePlan: launchProfile ? runtimePlanFromLaunchProfile(launchProfile) : undefined, lifecycle: createLifecycle(startTime), parentDescendantRegistryPath: parentRegistryPath });
+          unregisterRunningDescendant({ id, name, task: params.message ?? "resumed session", surface, startTime, sessionFile: sessionPath, interactive, runtimePlan: runtimePlanFromLaunchProfile(launchProfile), lifecycle: createLifecycle(startTime), parentDescendantRegistryPath: parentRegistryPath });
           throw error;
         }
 
-        // Preserve the effective timeout from a verified launch profile. Older
-        // profiles have no field, so fall back to the named profile; external
-        // unverified sessions remain disabled by default.
+        // Preserve the effective timeout from the launch profile. Profiles
+        // without the field fall back to their named profile's current default.
         const resumedAgentDefs = launchProfile?.agent ? loadAgentDefaults(launchProfile.agent) : null;
         const resumedWaitTimeout = launchProfile?.waitTimeout !== undefined
           ? launchProfile.waitTimeout
@@ -3050,10 +3003,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           childDescendantRegistryPath: childRegistryPath,
           interactive,
           agent: launchProfile?.agent ?? undefined,
-          runtimePlan: launchProfile ? runtimePlanFromLaunchProfile(launchProfile) : undefined,
+          runtimePlan: runtimePlanFromLaunchProfile(launchProfile),
           launchProfile,
           launchProfilePath: profileRead.path,
-          profileWarning,
           parentDescendantRegistryPath: parentRegistryPath,
           lifecycle: createLifecycle(startTime),
         };
@@ -3128,8 +3080,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                   launchProfilePath: running.launchProfilePath,
-                  profileStatus: running.launchProfile ? "verified" : "isolated-unverified",
-                  ...(running.profileWarning ? { profileWarning: running.profileWarning } : {}),
+                  profileStatus: "preserved",
                   ...(running.toolProfile ? { toolProfile: running.toolProfile } : {}),
                   ...(running.activity?.usage ? { usage: running.activity.usage } : {}),
                   ...(running.activity?.usageByModel ? { usageByModel: running.activity.usageByModel } : {}),
@@ -3164,9 +3115,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: profileWarning
-              ? `Session "${name}" resumed in isolated unverified mode. WARNING: ${profileWarning}.`
-              : `Session "${name}" resumed with its verified launch profile.`,
+            text: `Session "${name}" resumed with its preserved launch profile.`,
           }],
           details: {
             id,
@@ -3174,8 +3123,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             sessionPath,
             launchScriptFile,
             launchProfilePath: profileRead.path,
-            profileStatus: launchProfile ? "verified" : "isolated-unverified",
-            ...(profileWarning ? { profileWarning } : {}),
+            profileStatus: "preserved",
             status: "started",
           },
         };

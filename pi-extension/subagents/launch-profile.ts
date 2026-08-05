@@ -1,47 +1,28 @@
 import {
   closeSync,
   constants,
-  existsSync,
   fsyncSync,
-  linkSync,
-  lstatSync,
   mkdirSync,
   openSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
+import { dirname, isAbsolute, join } from "node:path";
 import type { ThinkingLevel } from "./runtime-routing.ts";
 import type { ExtensionMode } from "./extension-runtime.ts";
-import {
-  readBoundedRegularFile,
-  readRegularFilePrefix,
-  UnsafeFileError,
-} from "./safe-file.ts";
+import { readBoundedRegularFile, UnsafeFileError } from "./safe-file.ts";
 
 export const LAUNCH_PROFILE_VERSION = 1 as const;
 export const MAX_PROFILE_TOOLS = 256;
 export const MAX_PROFILE_EXTENSIONS = 64;
 export const MAX_PROFILE_BYTES = 128 * 1024;
-export const PROFILE_ATTESTATION_CUSTOM_TYPE = "pi-herdr-subagents.launch-profile-attestation";
 const MAX_VALUE_LENGTH = 4096;
-const MAX_ATTESTATION_SCAN_BYTES = 1024 * 1024;
-const PROFILE_KEY_BYTES = 32;
-const PROFILE_KEY_FILE_BYTES = PROFILE_KEY_BYTES * 2 + 1;
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const NONCE_PATTERN = /^[a-f0-9]{64}$/;
-const SIGNATURE_PATTERN = /^[a-f0-9]{64}$/;
-
-export interface LaunchProfileAttestation {
-  nonce: string;
-  signature: string;
-}
 
 /** Credential- and prompt-free settings needed to reproduce a Pi child launch. */
-export interface UnsignedSubagentLaunchProfile {
+export interface SubagentLaunchProfile {
   version: typeof LAUNCH_PROFILE_VERSION;
   model: string;
   thinking: ThinkingLevel;
@@ -65,16 +46,10 @@ export interface UnsignedSubagentLaunchProfile {
   waitTimeoutMessage?: "none" | "preview" | "full";
 }
 
-export interface SubagentLaunchProfile extends UnsignedSubagentLaunchProfile {
-  /** Host HMAC bound to the absolute session path and all profile fields. */
-  attestation: LaunchProfileAttestation;
-}
-
 export type LaunchProfileReadResult =
-  | { status: "verified"; profile: SubagentLaunchProfile; path: string }
+  | { status: "loaded"; profile: SubagentLaunchProfile; path: string }
   | { status: "absent"; path: string }
-  | { status: "malformed"; path: string; error: string }
-  | { status: "untrusted"; path: string; error: string };
+  | { status: "malformed"; path: string; error: string };
 
 export interface ResumeProfileLaunch {
   cwd: string;
@@ -98,11 +73,6 @@ export interface ToolProfileEvidence {
 
 export function getLaunchProfilePath(sessionFile: string): string {
   return `${sessionFile}.profile.json`;
-}
-
-export function getHostAttestationKeyPath(): string {
-  return process.env.PI_SUBAGENT_PROFILE_KEY_FILE ??
-    join(homedir(), ".pi", "agent", ".subagent-profile-attestation.key");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -155,7 +125,7 @@ function validateWaitTimeoutMessage(value: unknown): "none" | "preview" | "full"
   return value;
 }
 
-function validateUnsignedFields(value: Record<string, unknown>): UnsignedSubagentLaunchProfile {
+function validateProfileFields(value: Record<string, unknown>): SubagentLaunchProfile {
   if (value.version !== LAUNCH_PROFILE_VERSION) throw new Error("unsupported launch profile version");
   if (typeof value.thinking !== "string" || !THINKING_LEVELS.has(value.thinking)) {
     throw new Error("thinking is invalid");
@@ -211,7 +181,7 @@ function validateUnsignedFields(value: Record<string, unknown>): UnsignedSubagen
   };
 }
 
-export function validateUnsignedLaunchProfile(value: unknown): UnsignedSubagentLaunchProfile {
+export function validateLaunchProfile(value: unknown): SubagentLaunchProfile {
   if (!isRecord(value)) throw new Error("launch profile must be an object");
   const allowedKeys = new Set([
     "version", "model", "thinking", "cwd", "agent", "toolAllowlist", "deniedTools",
@@ -220,113 +190,7 @@ export function validateUnsignedLaunchProfile(value: unknown): UnsignedSubagentL
   ]);
   const unknown = Object.keys(value).filter((key) => !allowedKeys.has(key));
   if (unknown.length > 0) throw new Error(`launch profile contains unsupported fields: ${unknown.join(", ")}`);
-  return validateUnsignedFields(value);
-}
-
-export function validateLaunchProfile(value: unknown): SubagentLaunchProfile {
-  if (!isRecord(value)) throw new Error("launch profile must be an object");
-  const allowedKeys = new Set([
-    "version", "model", "thinking", "cwd", "agent", "toolAllowlist", "deniedTools",
-    "extensionMode", "extensionEntries", "inheritedExtensionEntries", "configRoot", "allowedChildAgents",
-    "waitTimeout", "waitTimeoutMessage", "attestation",
-  ]);
-  const unknown = Object.keys(value).filter((key) => !allowedKeys.has(key));
-  if (unknown.length > 0) throw new Error(`launch profile contains unsupported fields: ${unknown.join(", ")}`);
-  const unsigned = validateUnsignedFields(value);
-  if (!isRecord(value.attestation)) throw new Error("attestation must be an object");
-  const attestationKeys = Object.keys(value.attestation);
-  if (attestationKeys.some((key) => key !== "nonce" && key !== "signature")) {
-    throw new Error("attestation contains unsupported fields");
-  }
-  const nonce = validateString(value.attestation.nonce, "attestation.nonce");
-  const signature = validateString(value.attestation.signature, "attestation.signature");
-  if (!NONCE_PATTERN.test(nonce)) throw new Error("attestation.nonce is invalid");
-  if (!SIGNATURE_PATTERN.test(signature)) throw new Error("attestation.signature is invalid");
-  return { ...unsigned, attestation: { nonce, signature } };
-}
-
-function signaturePayload(sessionFile: string, profile: UnsignedSubagentLaunchProfile, nonce: string): string {
-  return [
-    "pi-herdr-subagents-launch-profile-v1",
-    resolve(sessionFile),
-    nonce,
-    JSON.stringify(profile),
-  ].join("\0");
-}
-
-function calculateSignature(
-  sessionFile: string,
-  profile: UnsignedSubagentLaunchProfile,
-  nonce: string,
-  key: Buffer,
-): string {
-  return createHmac("sha256", key).update(signaturePayload(sessionFile, profile, nonce)).digest("hex");
-}
-
-export function attestLaunchProfile(
-  sessionFile: string,
-  profile: UnsignedSubagentLaunchProfile,
-  key: Buffer,
-  nonce = randomBytes(32).toString("hex"),
-): SubagentLaunchProfile {
-  if (key.length !== PROFILE_KEY_BYTES) throw new Error(`profile attestation key must be ${PROFILE_KEY_BYTES} bytes`);
-  if (!NONCE_PATTERN.test(nonce)) throw new Error("profile attestation nonce is invalid");
-  const validated = validateUnsignedLaunchProfile(profile);
-  return {
-    ...validated,
-    attestation: {
-      nonce,
-      signature: calculateSignature(sessionFile, validated, nonce, key),
-    },
-  };
-}
-
-export function formatLaunchProfileAttestation(profile: SubagentLaunchProfile): string {
-  return JSON.stringify({
-    version: LAUNCH_PROFILE_VERSION,
-    nonce: profile.attestation.nonce,
-    signature: profile.attestation.signature,
-  });
-}
-
-export function parseLaunchProfileAttestation(value: string | undefined): LaunchProfileAttestation | null {
-  if (!value || value.length > 512) return null;
-  try {
-    const parsed = JSON.parse(value);
-    if (!isRecord(parsed) || parsed.version !== LAUNCH_PROFILE_VERSION) return null;
-    if (typeof parsed.nonce !== "string" || !NONCE_PATTERN.test(parsed.nonce)) return null;
-    if (typeof parsed.signature !== "string" || !SIGNATURE_PATTERN.test(parsed.signature)) return null;
-    return { nonce: parsed.nonce, signature: parsed.signature };
-  } catch {
-    return null;
-  }
-}
-
-export function loadOrCreateHostAttestationKey(path = getHostAttestationKeyPath()): Buffer {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  if (!existsSync(path)) {
-    const temporaryPath = join(dirname(path), `.${process.pid}-${randomBytes(8).toString("hex")}.key.tmp`);
-    const keyText = `${randomBytes(PROFILE_KEY_BYTES).toString("hex")}\n`;
-    try {
-      writeFileSync(temporaryPath, keyText, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      try {
-        linkSync(temporaryPath, path);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
-    } finally {
-      try { unlinkSync(temporaryPath); } catch {}
-    }
-  }
-
-  const raw = readBoundedRegularFile(path, PROFILE_KEY_FILE_BYTES, "profile attestation key");
-  const mode = lstatSync(path).mode & 0o777;
-  if ((mode & 0o077) !== 0) {
-    throw new Error("profile attestation key permissions must not allow group or other access");
-  }
-  const hex = raw.trim();
-  if (!NONCE_PATTERN.test(hex)) throw new Error("profile attestation key is malformed");
-  return Buffer.from(hex, "hex");
+  return validateProfileFields(value);
 }
 
 export function writeLaunchProfile(sessionFile: string, profile: SubagentLaunchProfile): string {
@@ -359,46 +223,7 @@ export function writeLaunchProfile(sessionFile: string, profile: SubagentLaunchP
   return profilePath;
 }
 
-function signatureMatches(
-  sessionFile: string,
-  profile: SubagentLaunchProfile,
-  key: Buffer,
-): boolean {
-  if (key.length !== PROFILE_KEY_BYTES) return false;
-  const { attestation, ...unsigned } = profile;
-  const expected = Buffer.from(calculateSignature(sessionFile, unsigned, attestation.nonce, key), "hex");
-  const actual = Buffer.from(attestation.signature, "hex");
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
-
-function sessionContainsAttestation(
-  sessionFile: string,
-  attestation: LaunchProfileAttestation,
-): boolean {
-  const prefix = readRegularFilePrefix(
-    sessionFile,
-    MAX_ATTESTATION_SCAN_BYTES,
-    "subagent session",
-  );
-  for (const line of prefix.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (
-        entry?.type === "custom" &&
-        entry.customType === PROFILE_ATTESTATION_CUSTOM_TYPE &&
-        entry.data?.version === LAUNCH_PROFILE_VERSION &&
-        entry.data?.nonce === attestation.nonce &&
-        entry.data?.signature === attestation.signature
-      ) return true;
-    } catch {
-      // Other malformed or truncated session lines cannot establish provenance.
-    }
-  }
-  return false;
-}
-
-export function readLaunchProfile(sessionFile: string, key: Buffer): LaunchProfileReadResult {
+export function readLaunchProfile(sessionFile: string): LaunchProfileReadResult {
   const path = getLaunchProfilePath(sessionFile);
   let raw: string;
   try {
@@ -408,24 +233,11 @@ export function readLaunchProfile(sessionFile: string, key: Buffer): LaunchProfi
     return { status: "malformed", path, error: error instanceof Error ? error.message : String(error) };
   }
 
-  let profile: SubagentLaunchProfile;
   try {
-    profile = validateLaunchProfile(JSON.parse(raw));
+    return { status: "loaded", profile: validateLaunchProfile(JSON.parse(raw)), path };
   } catch (error) {
     return { status: "malformed", path, error: error instanceof Error ? error.message : String(error) };
   }
-
-  if (!signatureMatches(sessionFile, profile, key)) {
-    return { status: "untrusted", path, error: "launch profile host signature does not match" };
-  }
-  try {
-    if (!sessionContainsAttestation(sessionFile, profile.attestation)) {
-      return { status: "untrusted", path, error: "launch profile attestation is absent from the bound session metadata" };
-    }
-  } catch (error) {
-    return { status: "untrusted", path, error: error instanceof Error ? error.message : String(error) };
-  }
-  return { status: "verified", profile, path };
 }
 
 /** Build the profile-controlled portion of a resume invocation without shell quoting. */
@@ -450,7 +262,6 @@ export function buildResumeProfileLaunch(
       PI_SUBAGENT_EXTENSION_MODE: validated.extensionMode,
       PI_SUBAGENT_EXTENSIONS: validated.inheritedExtensionEntries.join(","),
       PI_SUBAGENT_AGENT: validated.agent ?? "",
-      PI_SUBAGENT_PROFILE_ATTESTATION: formatLaunchProfileAttestation(validated),
     },
   };
 }
@@ -472,7 +283,7 @@ export function compareToolProfile(
       expected: null,
       actual,
       actualDenied,
-      reason: "no host-verified launch profile was applied",
+      reason: "no preserved launch profile was applied",
     };
   }
 
@@ -532,7 +343,7 @@ export function formatToolProfileEvidence(evidence: ToolProfileEvidence): string
     return `Tool profile: exact (${evidence.actual?.length ?? 0} observed tools match the post-deny launch allowlist).`;
   }
   if (evidence.status === "unrestricted") {
-    return `Tool profile: unrestricted (no --tools allowlist after verified deny checks; ${evidence.actual?.length ?? 0} tools observed).`;
+    return `Tool profile: unrestricted (no --tools allowlist after matching deny checks; ${evidence.actual?.length ?? 0} tools observed).`;
   }
   if (evidence.status === "unverified") {
     return `Tool profile: unverified (${evidence.reason ?? "insufficient host evidence"}).`;

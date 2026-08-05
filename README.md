@@ -329,23 +329,26 @@ Every initial Pi-backed launch writes `<session>.profile.json` beside the sessio
 This bounded sidecar contains only the effective model, thinking level, cwd, named-agent
 key, exact `--tools` allowlist (including `caller_ping` and `subagent_done`, or `null`
 when no allowlist was supplied), deny names, absolute extension runtime entries/mode,
-inherited caller entries, config root, and a public host attestation. It never stores
-the task, system prompt, credentials, permission grants, or the private attestation key.
+inherited caller entries, config root, allowed child profiles, and waiting-timeout policy.
+It never stores the task, system prompt, credentials, or permission grants.
 
-The host signs every field together with the canonical absolute session path. At the
-child's first `session_start`, the public nonce/signature is also persisted as Pi custom
-session metadata outside model context. `subagent_resume` reapplies executable extension
-or config entries only when the sidecar signature and bound session metadata both match.
-A malformed, tampered, symlinked, non-regular, oversized, or externally fabricated
-sidecar fails closed before a pane is started. The named-agent key is restored so the
-recursive same-agent guard continues to work after resume.
+`subagent_resume` validates and reapplies the preserved runtime policy. The named-agent
+key keeps recursive same-agent checks effective; tool and child-profile policies do not
+silently widen; explicit extension mode continues loading the same resolved entries; and
+waiting notifications retain their original effective settings. Profile files are
+strictly size-bounded regular files, reject unsupported or malformed fields, and use
+atomic writes.
 
-Older or external sessions with no profile can still resume, but use an isolated
-`--no-extensions` path that loads no extensions and accepts no sidecar extension/config
-entries. Results mark this path **isolated-unverified**; lifecycle-tool auto-exit and
-profile telemetry are unavailable on that path.
-Prefer `subagent_resume` over invoking `pi --session` directly, because a raw Pi resume
-bypasses host profile preservation, tracking, and completion telemetry.
+Profiles are intentionally unsigned local runtime manifests, not provenance or integrity
+proofs. Anyone who can modify a profile can change executable extension paths and other
+resume settings within the validated schema. Protect session directories accordingly and
+resume only profiles you trust.
+
+`subagent_resume` requires a current profile and refuses missing or malformed sidecars
+before creating a pane. This keeps a deleted profile from silently widening a resumed
+session through ambient discovery. Sessions created manually, externally, or by older
+versions can still be resumed directly with `pi --session`, but that bypasses profile
+preservation, Herdr tracking, and completion delivery.
 
 After all synchronous child startup handlers run, telemetry records the bounded names
 returned by `pi.getActiveTools()` plus the effective deny names. Completion requires

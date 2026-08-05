@@ -14,11 +14,6 @@ import {
   type WaitingTurnEvidence,
 } from "./interrupt-control.ts";
 import { readTrackedDescendants } from "./descendant-registry.ts";
-import {
-  LAUNCH_PROFILE_VERSION,
-  parseLaunchProfileAttestation,
-  PROFILE_ATTESTATION_CUSTOM_TYPE,
-} from "./launch-profile.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -247,20 +242,9 @@ export default function (pi: ExtensionAPI) {
     ctx.shutdown();
   }
 
-  // Show widget + status bar on session start and persist the host-signed
-  // attestation outside model context. Active tools are captured later at
-  // before_agent_start, after Pi has awaited every extension's startup handler.
+  // Active tools are captured later at before_agent_start, after Pi has
+  // awaited every extension's startup handler.
   pi.on("session_start", (_event, ctx) => {
-    const attestation = parseLaunchProfileAttestation(
-      process.env.PI_SUBAGENT_PROFILE_ATTESTATION,
-    );
-    if (attestation) {
-      ctx.sessionManager.appendCustomEntry(PROFILE_ATTESTATION_CUSTOM_TYPE, {
-        version: LAUNCH_PROFILE_VERSION,
-        ...attestation,
-      });
-    }
-
     denied = parseDeniedTools(deniedToolsValue);
     recorder.sessionStart();
     renderWidget(ctx, null);

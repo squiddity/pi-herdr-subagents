@@ -477,29 +477,22 @@ describe("session.ts", () => {
   });
 
   describe("seedSubagentSessionFile", () => {
-    it("puts host attestation metadata at the start of standalone sessions", () => {
+    it("creates a standalone session with no parent linkage or policy metadata", () => {
       const childFile = join(dir, "standalone-child.jsonl");
       seedSubagentSessionFile({
         mode: "standalone",
         childSessionFile: childFile,
         childCwd: "/tmp/standalone-child-cwd",
-        profileAttestation: {
-          version: 1,
-          customType: "pi-herdr-subagents.launch-profile-attestation",
-          nonce: "ab".repeat(32),
-          signature: "cd".repeat(32),
-        },
       });
 
       const entries = readFileSync(childFile, "utf8")
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));
-      assert.equal(entries.length, 2);
+      assert.equal(entries.length, 1);
       assert.equal(entries[0].type, "session");
       assert.equal(entries[0].parentSession, undefined);
-      assert.equal(entries[1].type, "custom");
-      assert.equal(entries[1].data.nonce, "ab".repeat(32));
+      assert.equal(entries[0].cwd, "/tmp/standalone-child-cwd");
     });
 
     it("creates a lineage-only child session with parent linkage and no copied turns", () => {
@@ -2493,16 +2486,6 @@ describe("tool registration", () => {
     });
   });
 
-  it("constructs external/legacy resumes with no ambient extension discovery", () => {
-    const args = (subagentsModule as any).__test__.buildIsolatedResumeArgs("/tmp/external.jsonl");
-    assert.deepEqual(args, [
-      "pi",
-      "--session",
-      "/tmp/external.jsonl",
-      "--no-extensions",
-    ]);
-  });
-
   it("keeps the recursive same-agent guard effective for restored resume identity", async () => {
     const previousAgent = process.env.PI_SUBAGENT_AGENT;
     process.env.PI_SUBAGENT_AGENT = "reviewer";
@@ -2608,6 +2591,24 @@ describe("tool registration", () => {
       result = await resumeTool.execute("call", { sessionPath: fifoPath }, undefined, undefined, {});
       assert.equal(result.details.error, "unsafe session path");
       assert.match(result.content[0].text, /regular file/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("requires a preserved profile before checking or creating a terminal", async () => {
+    const dir = createTestDir();
+    try {
+      const sessionPath = createSessionFile(dir, []);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+
+      const result = await resumeTool.execute("call", { sessionPath }, undefined, undefined, {});
+      assert.equal(result.details.error, "launch profile missing");
+      assert.equal(result.details.profileStatus, "absent");
+      assert.match(result.content[0].text, /Only sessions created with profile preservation are supported/);
+      assert.match(result.content[0].text, /pi --session/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
