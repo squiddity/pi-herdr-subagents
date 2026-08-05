@@ -209,7 +209,39 @@ subagent({ name: "Planner", agent: "planner", task: "Work through the design wit
 
 // Custom working directory
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
+
+// Hermetic extension set: no global/project/package discovery in the child
+subagent({
+  name: "Isolated worker",
+  task: "Run with only the requested runtime extensions",
+  extensionMode: "explicit",
+  extensions: "./tools/audit.ts,./tools/policy.ts",
+});
 ```
+
+### Extension loading
+
+`extensionMode: "normal"` preserves Pi's normal global, project, settings, and package extension discovery. Any paths in `extensions` are added with `-e`. `extensionMode: "explicit"` launches the child with `--no-extensions`, then explicitly loads:
+
+1. this currently-running subagents extension entrypoint;
+2. the mandatory `subagent-done.ts` child lifecycle extension; and
+3. the entries supplied through `extensions`.
+
+Relative caller paths are resolved to absolute paths once against the effective child `cwd`; duplicate entries are removed. `extensions` is comma-separated, so extension entry paths containing commas are not supported.
+
+The resolved mode and absolute caller-extension list are exported to Pi-backed children. Descendant Pi-backed `subagent` calls inherit each omitted field independently, while an explicit descendant value overrides that field. Use `extensions: ""` to clear an inherited caller-extension list. Claude-backed agents do not inherit this Pi runtime and reject calls that explicitly pass `extensionMode` or `extensions`.
+
+Explicit mode is useful when developing this package from source. Start the parent from the checkout, then descendants continue loading this exact source entrypoint without requiring an installed package:
+
+```bash
+pi -e ./pi-extension/subagents/index.ts
+```
+
+```typescript
+subagent({ name: "Source worker", task: "Test local changes", extensionMode: "explicit" });
+```
+
+> **Security:** Every explicitly loaded extension executes arbitrary code with the child's full OS permissions, and inherited entries execute again in every Pi-backed descendant. Absolute resolution prevents later cwd changes from retargeting a relative path, but it does not verify, sandbox, or pin the file's contents. Only pass trusted extension entrypoints. Explicit mode suppresses ambient extension discovery; it does not sandbox the mandatory subagents extensions or caller-provided code.
 
 ### Parameters
 
@@ -226,6 +258,8 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| `extensionMode`        | `normal` \| `explicit` | `normal` or inherited | Keep normal Pi extension discovery, or disable discovery and load only the explicit child runtime. Pi-backed agents only. |
+| `extensions`           | string  | — or inherited | Comma-separated extension entry paths, resolved against the effective child cwd. An explicit value replaces the inherited caller list. |
 
 ---
 

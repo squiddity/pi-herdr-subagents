@@ -36,6 +36,12 @@ import {
   type ThinkingLevel,
 } from "./runtime-routing.ts";
 import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import {
+  assertExtensionRuntimeSupported,
+  buildPiExtensionArgs,
+  getExtensionRuntimeEnv,
+  resolveExtensionRuntime,
+} from "./extension-runtime.ts";
 
 import {
   findLastAssistantMessage,
@@ -75,8 +81,14 @@ import {
   type PaneInspection,
 } from "./lifecycle.ts";
 
-/** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
-const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+/** Absolute paths for this currently-running extension entrypoint and its directory. */
+const SUBAGENTS_ENTRY_PATH = fileURLToPath(import.meta.url);
+const SUBAGENTS_DIR = dirname(SUBAGENTS_ENTRY_PATH);
+const SUBAGENT_DONE_ENTRY_PATH = join(SUBAGENTS_DIR, "subagent-done.ts");
+const CURRENT_EXTENSION_ENTRIES = {
+  subagentsEntry: SUBAGENTS_ENTRY_PATH,
+  subagentDoneEntry: SUBAGENT_DONE_ENTRY_PATH,
+};
 
 // Survive /reload: replace presentation timers while keeping active completion
 // watchers and their registry alive. Old module closures continue watching the
@@ -153,6 +165,18 @@ const SubagentParams = Type.Object({
     Type.String({
       description:
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
+    }),
+  ),
+  extensionMode: Type.Optional(
+    Type.Union([Type.Literal("normal"), Type.Literal("explicit")], {
+      description:
+        'Extension loading mode. "normal" (default) keeps Pi discovery; "explicit" disables ambient extension discovery and loads only the subagents runtime plus caller-specified extensions. This does not restrict OS access or disable all config/instructions. Omit in a child to inherit its parent runtime.',
+    }),
+  ),
+  extensions: Type.Optional(
+    Type.String({
+      description:
+        "Comma-separated extension entry paths. Relative paths resolve once against the effective child cwd. Omit in a child to inherit; pass an empty string to clear inherited caller extensions.",
     }),
   ),
   fork: Type.Optional(
@@ -1230,6 +1254,11 @@ async function launchSubagent(
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+  const childBackend = agentDefs?.cli === "claude" ? "claude" : "pi";
+  assertExtensionRuntimeSupported(childBackend, params);
+  const extensionRuntime = childBackend === "pi"
+    ? resolveExtensionRuntime(params, targetCwdForSession)
+    : { extensionMode: "normal" as const, extensions: [] };
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
@@ -1365,12 +1394,15 @@ async function launchSubagent(
 
   // ── Pi CLI path ──
 
-  // Build pi command
+  // Build pi command. Explicit mode suppresses all ambient extension discovery,
+  // then restores this orchestrator, the mandatory child lifecycle extension,
+  // and the caller's resolved extension entries in that order.
   const parts: string[] = ["pi"];
   parts.push("--session", shellQuote(subagentSessionFile));
 
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellQuote(subagentDonePath));
+  for (const arg of buildPiExtensionArgs(extensionRuntime, CURRENT_EXTENSION_ENTRIES)) {
+    parts.push(arg.startsWith("-") ? arg : shellQuote(arg));
+  }
 
   if (effectiveModel) {
     parts.push("--model", shellQuote(effectiveModel));
@@ -1415,6 +1447,9 @@ async function launchSubagent(
 
   if (denySet.size > 0) {
     envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
+  }
+  for (const [name, value] of Object.entries(getExtensionRuntimeEnv(extensionRuntime))) {
+    envParts.push(`${name}=${shellQuote(value)}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
   if (params.agent) {

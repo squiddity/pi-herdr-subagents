@@ -2229,6 +2229,19 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
+  it("registers recursive extension loading parameters on subagent", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+
+    const modeSchema = subagentTool.parameters.properties.extensionMode;
+    assert.deepEqual(modeSchema.anyOf.map((entry: any) => entry.const), ["normal", "explicit"]);
+    assert.equal(subagentTool.parameters.properties.extensions.type, "string");
+    assert.match(subagentTool.parameters.properties.extensions.description, /effective child cwd/);
+  });
+
   it("registers subagent_resume with an autoExit override", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
