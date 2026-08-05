@@ -217,7 +217,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | ---------------------- | ------- | -------------- | ------------------------------------------------------------------------------------------------- |
 | `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
-| `agent`                | string  | —              | Load defaults from agent definition                                                               |
+| `agent`                | string  | —              | Load defaults by exact frontmatter name; caller-supplied hidden keys remain directly invokable and unknown keys fail before launch |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | agent, configured, or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
@@ -315,7 +315,7 @@ This always forks the current session into a subagent with full conversation con
 
 ## Custom Agents
 
-Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Keep the filename and frontmatter `name` aligned (for example, `researcher.md` must declare `name: researcher`) so discovery and direct invocation agree:
+Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). The frontmatter `name` is the canonical catalog, invocation, and `allowed-child-agents` identity; the filename may differ:
 
 ```markdown
 ---
@@ -346,6 +346,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
+| `allowed-child-agents` | string | Comma-separated exact frontmatter names this agent may launch; an empty value denies all named children                                                                                              |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
@@ -449,6 +450,19 @@ name: focused-agent
 deny-tools: subagent
 ---
 ```
+
+### `allowed-child-agents`
+
+A named profile can restrict which exact named profiles it may launch. Omit the field for an unrestricted profile; use an empty value to deny every child profile. A child launched under a restricted profile must name an allowed profile, and unknown or denied names fail before a pane is created.
+
+```yaml
+---
+name: planner
+allowed-child-agents: scout, reviewer
+---
+```
+
+The policy is passed to Pi-backed descendants through a host-controlled environment value. Malformed propagated policy data fails closed rather than broadening the launch surface. This controls the extension's named-profile launch path; it is not a sandbox for shell commands or other operating-system access.
 
 ### Recommended Configuration
 
