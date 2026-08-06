@@ -56,7 +56,16 @@ import {
   parentDescendantRegistryPath,
   registerDescendant,
   unregisterDescendant,
+  readTrackedDescendants,
 } from "./descendant-registry.ts";
+import {
+  atomicWriteJson,
+  completionControlFileExists,
+  createCompletionControlRequest,
+  isSafelyWaitingForCompletion,
+  readCompletionControlRequest,
+  type CompletionControlRequest,
+} from "./interrupt-control.ts";
 
 import {
   findLastAssistantMessage,
@@ -664,6 +673,7 @@ interface RunningSubagent {
   sessionFile: string;
   launchScriptFile?: string;
   activityFile?: string;
+  controlFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
     ok: boolean;
@@ -692,6 +702,8 @@ interface RunningSubagent {
   runtimePlan: ResolvedRuntimePlan | undefined;
   /** Registry owned by this process's parent; contains this running child. */
   parentDescendantRegistryPath?: string;
+  /** Registry owned by this child; completion must fail closed while it is nonempty. */
+  childDescendantRegistryPath?: string;
 }
 
 interface SubagentRuntime {
@@ -1045,7 +1057,13 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     : { ok: false, reason: read.reason, error: read.error };
 
   if (read.ok) running.activity = read.activity;
+  else running.activity = undefined;
   running.lifecycle = observeActivity(ensureLifecycle(running), read, observedAt);
+}
+
+/** Final synchronous sidecar read used immediately before completion requests. */
+export function refreshCompletionActivity(running: RunningSubagent, observedAt = Date.now()): void {
+  observeRunningSubagent(running, observedAt);
 }
 
 function resolveInterruptTarget(params: { id?: string; name?: string }):
@@ -1072,6 +1090,88 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
+function requestWaitingSubagentCompletion(
+  running: RunningSubagent,
+  requestedAt = Date.now(),
+): { ok: true; request: CompletionControlRequest; repeated: boolean } | { error: string } {
+  const activity = running.activity;
+  if (!activity || !isSafelyWaitingForCompletion(activity)) {
+    return {
+      error:
+        `Subagent "${running.name}" is not safely waiting with a completed, content-bearing final answer. ` +
+        "No completion request was sent.",
+    };
+  }
+  if (!running.controlFile) {
+    return { error: `Subagent "${running.name}" has no completion control channel.` };
+  }
+
+  let summary: string | null = null;
+  try {
+    summary = existsSync(running.sessionFile)
+      ? findLastAssistantMessage(getNewEntries(running.sessionFile, 0))
+      : null;
+  } catch (error) {
+    return {
+      error:
+        `Cannot safely complete subagent "${running.name}": its session transcript is unreadable ` +
+        `(${error instanceof Error ? error.message : String(error)}).`,
+    };
+  }
+  if (!summary?.trim()) {
+    return {
+      error:
+        `Subagent "${running.name}" reported a completed turn but its session has no usable final assistant text. ` +
+        "No completion request was sent.",
+    };
+  }
+
+  if (running.childDescendantRegistryPath) {
+    try {
+      const descendants = readTrackedDescendants(running.childDescendantRegistryPath);
+      if (descendants.length > 0) {
+        const names = descendants.map((child) => `${child.name} [${child.id}]`).join(", ");
+        return {
+          error: `Cannot complete subagent "${running.name}" while tracked descendants remain: ${names}`,
+        };
+      }
+    } catch (error) {
+      return {
+        error:
+          `Cannot safely complete subagent "${running.name}": its descendant registry is unreadable ` +
+          `(${error instanceof Error ? error.message : String(error)}).`,
+      };
+    }
+  }
+
+  if (completionControlFileExists(running.controlFile)) {
+    const existing = readCompletionControlRequest(running.controlFile, running.id);
+    if (
+      existing.ok &&
+      existing.request.expectedActivitySequence === activity.sequence &&
+      existing.request.expectedTurnIndex === (activity.turnIndex ?? null)
+    ) {
+      return { ok: true, request: existing.request, repeated: true };
+    }
+  }
+
+  const request = createCompletionControlRequest({
+    runningChildId: running.id,
+    activity,
+    requestedAt,
+  });
+  try {
+    atomicWriteJson(running.controlFile, request);
+  } catch (error) {
+    return {
+      error:
+        `Failed to request completion from subagent "${running.name}": ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  return { ok: true, request, repeated: false };
+}
+
 function requestSubagentInterrupt(
   running: RunningSubagent,
   interruptPaneKey: (surface: string) => void = interruptPane,
@@ -1089,7 +1189,7 @@ function requestSubagentInterrupt(
 }
 
 function handleSubagentInterrupt(
-  params: { id?: string; name?: string },
+  params: { id?: string; name?: string; finish?: boolean },
   interruptPaneKey: (surface: string) => void = interruptPane,
 ) {
   const resolved = resolveInterruptTarget(params);
@@ -1106,7 +1206,7 @@ function handleSubagentInterrupt(
       content: [{
         type: "text" as const,
         text:
-          "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
+          "Subagent interruption is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
       }],
       details: { error: "claude interrupt unsupported", id: running.id, name: running.name },
     };
@@ -1114,6 +1214,47 @@ function handleSubagentInterrupt(
 
   const now = Date.now();
   observeRunningSubagent(running, now);
+  const projection = projectLifecycle(ensureLifecycle(running), now);
+
+  // Default behavior is completion-aware: a child that already finished a
+  // normal turn should return that answer instead of receiving a useless Escape.
+  if (params.finish !== false && running.activity?.phase === "waiting") {
+    const completion = requestWaitingSubagentCompletion(running, now);
+    if ("error" in completion) {
+      return {
+        content: [{ type: "text" as const, text: completion.error }],
+        details: { error: completion.error, id: running.id, name: running.name },
+      };
+    }
+    updateWidget();
+    const text = completion.repeated
+      ? `Completion is already requested for waiting subagent "${running.name}".`
+      : `Completion requested for waiting subagent "${running.name}". Its final answer will be delivered automatically.`;
+    return {
+      content: [{ type: "text" as const, text }],
+      details: {
+        id: running.id,
+        name: running.name,
+        status: "completion_requested",
+        requestId: completion.request.requestId,
+        repeated: completion.repeated,
+      },
+    };
+  }
+
+  if (
+    params.finish !== false &&
+    projection.kind !== "active" &&
+    projection.kind !== "blocked"
+  ) {
+    const error = projection.kind === "interrupted"
+      ? `Subagent "${running.name}" already has an interrupted turn and is still open. Send it another prompt, or call subagent_interrupt again after it reaches a safe waiting state.`
+      : `Subagent "${running.name}" is ${projection.kind}; no active turn can be interrupted and no safe completed answer is available.`;
+    return {
+      content: [{ type: "text" as const, text: error }],
+      details: { error, id: running.id, name: running.name, status: projection.kind },
+    };
+  }
 
   const interruption = requestSubagentInterrupt(running, interruptPaneKey);
   if ("error" in interruption) {
@@ -1126,8 +1267,11 @@ function handleSubagentInterrupt(
   running.lifecycle = markInterruptRequested(ensureLifecycle(running), now);
   updateWidget();
 
+  const suffix = params.finish === false
+    ? " The session remains open."
+    : " The active turn is being cancelled; no result will be fabricated from an aborted turn.";
   return {
-    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` }],
+    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}".${suffix}` }],
     details: { id: running.id, name: running.name, status: "interrupt_requested" },
   };
 }
@@ -1248,6 +1392,7 @@ export const __test__ = {
   resolveDenyTools,
   resolveInterruptTarget,
   requestSubagentInterrupt,
+  requestWaitingSubagentCompletion,
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
@@ -1397,6 +1542,7 @@ async function launchSubagent(
   }
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
+  const controlFile = join(artifactDir, "subagent-control", `${id}.json`);
   mkdirSync(dirname(activityFile), { recursive: true });
   const parentRegistryPath = parentDescendantRegistryPath();
   const childRegistryPath = childDescendantRegistryPath(artifactDir, subagentSessionFile);
@@ -1548,6 +1694,7 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
+  envParts.push(`PI_SUBAGENT_CONTROL_FILE=${shellQuote(controlFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
@@ -1637,6 +1784,8 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    controlFile,
+    childDescendantRegistryPath: childRegistryPath,
     interactive: effectiveInteractive,
     runtimePlan,
     parentDescendantRegistryPath: parentRegistryPath,
@@ -2136,16 +2285,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Finish or interrupt a currently running Pi-backed subagent. " +
+        "If the child is safely waiting after a completed turn, its existing final answer is accepted and delivered automatically. " +
+        "If the child is active, Escape cancels only that turn and the session remains open; aborted output is not treated as a result. " +
+        "Set finish=false for explicit turn-only Escape behavior.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Finish or interrupt a currently running Pi-backed subagent. " +
+        "A safely waiting child is completed and its final answer is delivered automatically. " +
+        "An active child receives Escape and remains open; set finish=false for turn-only behavior.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        finish: Type.Optional(Type.Boolean({
+          description: "When true (default), safely complete a waiting child; false always sends turn-only Escape.",
+        })),
       }),
 
       async execute(_toolCallId, params) {
@@ -2166,6 +2319,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderResult(result, _opts, theme) {
         const details = result.details as any;
+        if (details?.status === "completion_requested") {
+          return new Text(
+            theme.fg("success", "✓") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
+              theme.fg("dim", details.repeated ? " — completion already requested" : " — completion requested"),
+            0,
+            0,
+          );
+        }
         if (details?.status === "interrupt_requested") {
           return new Text(
             theme.fg("accent", "▸") +
@@ -2365,6 +2528,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
+        const controlFile = join(artifactDir, "subagent-control", `${id}.json`);
         mkdirSync(dirname(activityFile), { recursive: true });
         const parentRegistryPath = parentDescendantRegistryPath();
         const childRegistryPath = childDescendantRegistryPath(artifactDir, sessionPath);
@@ -2394,6 +2558,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_CONTROL_FILE=${shellQuote(controlFile)}`);
         // Set false explicitly so a parent auto-exit environment cannot leak
         // into a resumed child.
         resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${shellQuote(autoExit ? "1" : "")}`);
@@ -2433,6 +2598,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             surface,
             startTime,
             sessionFile: sessionPath,
+            controlFile,
+            childDescendantRegistryPath: childRegistryPath,
             interactive,
             runtimePlan: runtimePlanFromLaunchProfile(launchProfile),
             lifecycle: createLifecycle(startTime),
@@ -2451,6 +2618,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
+          controlFile,
+          childDescendantRegistryPath: childRegistryPath,
           interactive,
           runtimePlan: runtimePlanFromLaunchProfile(launchProfile),
           parentDescendantRegistryPath: parentRegistryPath,
