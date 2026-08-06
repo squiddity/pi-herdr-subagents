@@ -17,7 +17,7 @@ export interface MessageEntry extends SessionEntry {
   };
 }
 
-export type SeededSubagentSessionMode = "lineage-only" | "fork";
+export type SeededSubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
@@ -47,20 +47,24 @@ function getForkContentLines(parentSessionFile: string): string[] {
 
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
-  parentSessionFile: string;
+  parentSessionFile?: string;
   childSessionFile: string;
   childCwd: string;
 }): void {
+  if (params.mode !== "standalone" && !params.parentSessionFile) {
+    throw new Error(`${params.mode} session seeding requires a parent session file`);
+  }
   const header = {
     type: "session",
     version: 3,
     id: randomUUID(),
     timestamp: new Date().toISOString(),
     cwd: params.childCwd,
-    parentSession: params.parentSessionFile,
+    ...(params.mode === "standalone" ? {} : { parentSession: params.parentSessionFile }),
   };
-  const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+  const contentLines = params.mode === "fork"
+    ? getForkContentLines(params.parentSessionFile!)
+    : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });

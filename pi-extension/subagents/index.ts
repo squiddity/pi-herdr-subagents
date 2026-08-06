@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -40,8 +40,17 @@ import {
   assertExtensionRuntimeSupported,
   buildPiExtensionArgs,
   getExtensionRuntimeEnv,
+  getPiExtensionEntries,
   resolveExtensionRuntime,
 } from "./extension-runtime.ts";
+import {
+  buildResumeProfileLaunch,
+  readLaunchProfile,
+  writeLaunchProfile,
+  type LaunchProfileReadResult,
+  type SubagentLaunchProfile,
+} from "./launch-profile.ts";
+import { assertRegularFile, UnsafeFileError } from "./safe-file.ts";
 import {
   childDescendantRegistryPath,
   parentDescendantRegistryPath,
@@ -1192,6 +1201,22 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit
   return { autoExit, interactive: !autoExit };
 }
 
+function resolveResumeSessionPath(sessionPath: string): string {
+  return resolvePath(sessionPath);
+}
+
+function runtimePlanFromLaunchProfile(profile: SubagentLaunchProfile): ResolvedRuntimePlan {
+  const separator = profile.model.indexOf("/");
+  return {
+    provider: separator > 0 ? profile.model.slice(0, separator) : "unknown",
+    modelId: separator > 0 ? profile.model.slice(separator + 1) : profile.model,
+    model: profile.model,
+    thinking: profile.thinking,
+    modelSource: "parent",
+    thinkingSource: "parent",
+  };
+}
+
 function assertAutoExitOverrideSupported(
   backend: "pi" | "claude",
   autoExit: boolean | undefined,
@@ -1226,6 +1251,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  resolveResumeSessionPath,
   assertAutoExitOverrideSupported,
   runningSubagents,
   formatElapsed,
@@ -1291,7 +1317,7 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
   const childBackend = agentDefs?.cli === "claude" ? "claude" : "pi";
@@ -1300,6 +1326,9 @@ async function launchSubagent(
   const extensionRuntime = childBackend === "pi"
     ? resolveExtensionRuntime(params, targetCwdForSession)
     : { extensionMode: "normal" as const, extensions: [] };
+  const denySet = resolveDenyTools(agentDefs);
+  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+  const effectiveConfigRoot = resolvePath(effectiveAgentDir);
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
@@ -1312,6 +1341,27 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 6),
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+
+  // Write the profile before creating a pane or starting a process. Claude
+  // launches intentionally remain outside this Pi-only policy-preservation
+  // contract.
+  if (childBackend === "pi") {
+    writeLaunchProfile(subagentSessionFile, {
+      version: 1,
+      model: runtimePlan.model,
+      thinking: effectiveThinking,
+      cwd: resolvePath(targetCwdForSession),
+      agent: params.agent ?? null,
+      toolAllowlist: toolAllowlist ? toolAllowlist.split(",") : null,
+      deniedTools: [...denySet],
+      extensionMode: extensionRuntime.extensionMode,
+      extensionEntries: getPiExtensionEntries(extensionRuntime, CURRENT_EXTENSION_ENTRIES),
+      inheritedExtensionEntries: [...extensionRuntime.extensions],
+      configRoot: effectiveConfigRoot,
+      allowedChildAgents: agentDefs?.allowedChildAgents ?? null,
+    });
+  }
 
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
@@ -1330,9 +1380,14 @@ async function launchSubagent(
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-
-  if (launchBehavior.seededSessionMode) {
+  if (childBackend === "pi") {
+    seedSubagentSessionFile({
+      mode: launchBehavior.seededSessionMode ?? "standalone",
+      parentSessionFile: sessionFile,
+      childSessionFile: subagentSessionFile,
+      childCwd: targetCwdForSession,
+    });
+  } else if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
       mode: launchBehavior.seededSessionMode,
       parentSessionFile: sessionFile,
@@ -1356,7 +1411,6 @@ async function launchSubagent(
   const summaryInstruction = effectiveAutoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1472,33 +1526,21 @@ async function launchSubagent(
     parts.push(flag, shellQuote(syspromptPath));
   }
 
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
   if (toolAllowlist) {
     parts.push("--tools", shellQuote(toolAllowlist));
   }
 
-  // Build env prefix: denied tools + subagent identity + config dir propagation
+  // Build env prefix from the same resolved policy written to the profile.
   const envParts: string[] = [];
-
-  // If the target cwd has its own .pi/agent/, use that as the config root.
-  // Otherwise propagate the current/global agent dir.
-  if (localAgentDir && existsSync(localAgentDir)) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(localAgentDir)}`);
-  } else if (process.env.PI_CODING_AGENT_DIR) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
-  }
-
-  if (denySet.size > 0) {
-    envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
-  }
+  envParts.push(`PI_CODING_AGENT_DIR=${shellQuote(effectiveConfigRoot)}`);
+  // Set even when empty so a recursive child cannot inherit a parent deny list.
+  envParts.push(`PI_DENY_TOOLS=${shellQuote([...denySet].join(","))}`);
   for (const [name, value] of Object.entries(getExtensionRuntimeEnv(extensionRuntime))) {
     envParts.push(`${name}=${shellQuote(value)}`);
   }
   envParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
   envParts.push(`PI_SUBAGENT_NAME=${shellQuote(params.name)}`);
-  if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
-  }
+  envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent ?? "")}`);
   envParts.push(`PI_SUBAGENT_ALLOWED_CHILD_AGENTS=${shellQuote(JSON.stringify(agentDefs?.allowedChildAgents ?? null))}`);
   // Set false explicitly so a parent auto-exit environment cannot leak into
   // a child whose per-spawn override disables it.
@@ -1540,8 +1582,8 @@ async function launchSubagent(
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellQuote(effectiveCwd)} && ` : "";
+  // This is the same canonical cwd recorded in the launch profile.
+  const cdPrefix = `cd ${shellQuote(resolvePath(targetCwdForSession))} && `;
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -2207,14 +2249,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Use when a sub-agent was cancelled or needs follow-up work. Tracked resumes require the session's preserved launch profile; use pi --session directly for external sessions.",
       promptSnippet:
         "Resume a previous sub-agent session in a new herdr pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Use when a sub-agent was cancelled or needs follow-up work. Tracked resumes require the session's preserved launch profile; use pi --session directly for external sessions.",
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
@@ -2268,38 +2310,64 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
 
+        // Canonicalize the path before any profile-controlled cwd change. The
+        // tracked resume tool intentionally requires a profile created by the
+        // initial Pi-backed launch; external sessions remain resumable with
+        // raw `pi --session`.
+        const sessionPath = resolveResumeSessionPath(params.sessionPath);
+        try {
+          assertRegularFile(sessionPath, "subagent session");
+        } catch (error) {
+          const missing = error instanceof UnsafeFileError && error.code === "missing";
+          return {
+            content: [{
+              type: "text",
+              text: missing
+                ? `Error: session file not found: ${sessionPath}`
+                : `Refusing to resume unsafe session path: ${error instanceof Error ? error.message : String(error)}`,
+            }],
+            details: { error: missing ? "session not found" : "unsafe session path" },
+          };
+        }
+
+        const profileRead: LaunchProfileReadResult = readLaunchProfile(sessionPath);
+        if (profileRead.status !== "loaded") {
+          const malformed = profileRead.status === "malformed";
+          return {
+            content: [{
+              type: "text",
+              text: malformed
+                ? `Refusing to resume: launch profile is malformed: ${profileRead.error}`
+                : `Refusing to resume: launch profile is missing at ${profileRead.path}. ` +
+                  "Only sessions created with profile preservation are supported; use pi --session for external sessions.",
+            }],
+            details: {
+              error: malformed ? "invalid launch profile" : "launch profile missing",
+              launchProfilePath: profileRead.path,
+              profileStatus: profileRead.status,
+            },
+          };
+        }
+        const launchProfile = profileRead.profile;
+
         if (!isTerminalAvailable()) {
           return muxUnavailableResult();
         }
 
-        if (!existsSync(params.sessionPath)) {
-          return {
-            content: [
-              { type: "text", text: `Error: session file not found: ${params.sessionPath}` },
-            ],
-            details: { error: "session not found" },
-          };
-        }
-
-        // Record entry count before resuming so we can extract new messages
-        const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
-
+        // Record entry count before resuming so we can extract new messages.
+        const entryCountBefore = getNewEntries(sessionPath, 0).length;
         const surface = createSubagentPane(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellQuote(params.sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellQuote(subagentDonePath));
+        const profileLaunch = buildResumeProfileLaunch(sessionPath, launchProfile);
+        const parts = profileLaunch.args.map((arg) => shellQuote(arg));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
         const parentRegistryPath = parentDescendantRegistryPath();
-        const childRegistryPath = childDescendantRegistryPath(artifactDir, params.sessionPath);
+        const childRegistryPath = childDescendantRegistryPath(artifactDir, sessionPath);
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2319,22 +2387,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           parts.push(shellQuote(`@${resumeMsgFile}`));
         }
 
-        // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-        const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`);
-        }
-        resumeEnvParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
+        const resumeEnvParts: string[] = Object.entries(profileLaunch.env)
+          .map(([key, value]) => `${key}=${shellQuote(value)}`);
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellQuote(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(params.sessionPath)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_DESCENDANTS_FILE=${shellQuote(childRegistryPath)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellQuote(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellQuote(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
         // Set false explicitly so a parent auto-exit environment cannot leak
         // into a resumed child.
         resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${shellQuote(autoExit ? "1" : "")}`);
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
+        const cdPrefix = `cd ${shellQuote(profileLaunch.cwd)} && `;
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${cdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2354,7 +2420,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             scriptPreamble: [
               `# Subagent resume script for ${name}`,
               `# Generated: ${new Date().toISOString()}`,
-              `# Session: ${params.sessionPath}`,
+              `# Session: ${sessionPath}`,
               `# Surface: ${surface}`,
               ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
             ].join("\n"),
@@ -2366,9 +2432,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             task: params.message ?? "resumed session",
             surface,
             startTime,
-            sessionFile: params.sessionPath,
+            sessionFile: sessionPath,
             interactive,
-            runtimePlan: undefined,
+            runtimePlan: runtimePlanFromLaunchProfile(launchProfile),
             lifecycle: createLifecycle(startTime),
             parentDescendantRegistryPath: parentRegistryPath,
           });
@@ -2382,11 +2448,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           task: params.message ?? "resumed session",
           surface,
           startTime,
-          sessionFile: params.sessionPath,
+          sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
           interactive,
-          runtimePlan: undefined,
+          runtimePlan: runtimePlanFromLaunchProfile(launchProfile),
           parentDescendantRegistryPath: parentRegistryPath,
           lifecycle: createLifecycle(startTime),
         };
@@ -2413,7 +2479,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const completionApi = selectCompletionApi(pi, runtime.pi);
 
             if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
+              const sessionRef = `\n\nSession: ${sessionPath}\nResume: pi --session ${sessionPath}`;
               completionApi.sendMessage(
                 {
                   customType: "subagent_ping",
@@ -2422,7 +2488,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   details: {
                     name: result.ping.name,
                     message: result.ping.message,
-                    sessionFile: params.sessionPath,
+                    sessionFile: sessionPath,
                   },
                 },
                 { triggerTurn: true, deliverAs: "steer" },
@@ -2430,7 +2496,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
+            const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
@@ -2438,7 +2504,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ? `Resumed session exited with code ${result.exitCode}`
                   : "Resumed session exited without new output");
             const basePresentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
+              { ...result, summary, sessionFile: sessionPath },
               name,
             );
             const presentation = running.runtimePlan?.runtimeMismatch
@@ -2455,7 +2521,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   task: params.message ?? "resumed session",
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
-                  sessionFile: params.sessionPath,
+                  sessionFile: sessionPath,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
                 },
@@ -2490,7 +2556,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           details: {
             id,
             name,
-            sessionPath: params.sessionPath,
+            sessionPath,
             launchScriptFile,
             status: "started",
           },
