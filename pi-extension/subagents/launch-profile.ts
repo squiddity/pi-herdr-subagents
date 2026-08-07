@@ -48,6 +48,10 @@ export interface SubagentLaunchProfile {
   configRoot: string;
   /** Exact named child profiles allowed by the resolved parent profile. */
   allowedChildAgents?: string[] | null;
+  /** Effective one-shot waiting timeout: immediate, bounded seconds, or null to disable. */
+  waitTimeout?: number | "immediate" | null;
+  /** Policy for including the latest final assistant message in timeout steers. */
+  waitTimeoutMessage?: "none" | "preview" | "full";
 }
 
 export type LaunchProfileReadResult =
@@ -98,6 +102,23 @@ function validateStringList(
   return result;
 }
 
+const MAX_WAIT_TIMEOUT_SECONDS = 7 * 24 * 60 * 60;
+
+function validateWaitTimeout(value: unknown, field: string): number | "immediate" {
+  if (value === "immediate") return value;
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > MAX_WAIT_TIMEOUT_SECONDS) {
+    throw new Error(`${field} must be an integer from 1 to ${MAX_WAIT_TIMEOUT_SECONDS} or "immediate"`);
+  }
+  return value as number;
+}
+
+function validateWaitTimeoutMessage(value: unknown): "none" | "preview" | "full" {
+  if (value !== "none" && value !== "preview" && value !== "full") {
+    throw new Error("waitTimeoutMessage must be none, preview, or full");
+  }
+  return value;
+}
+
 function validateProfileFields(value: Record<string, unknown>): SubagentLaunchProfile {
   if (value.version !== LAUNCH_PROFILE_VERSION) {
     throw new Error("unsupported launch profile version");
@@ -143,6 +164,16 @@ function validateProfileFields(value: Record<string, unknown>): SubagentLaunchPr
             ? null
             : validateStringList(value.allowedChildAgents, "allowedChildAgents", MAX_PROFILE_TOOLS),
         }),
+    ...(value.waitTimeout === undefined
+      ? {}
+      : {
+          waitTimeout: value.waitTimeout === null
+            ? null
+            : validateWaitTimeout(value.waitTimeout, "waitTimeout"),
+        }),
+    ...(value.waitTimeoutMessage === undefined
+      ? {}
+      : { waitTimeoutMessage: validateWaitTimeoutMessage(value.waitTimeoutMessage) }),
   };
 }
 
@@ -161,6 +192,8 @@ export function validateLaunchProfile(value: unknown): SubagentLaunchProfile {
     "inheritedExtensionEntries",
     "configRoot",
     "allowedChildAgents",
+    "waitTimeout",
+    "waitTimeoutMessage",
   ]);
   const unknown = Object.keys(value).filter((key) => !allowedKeys.has(key));
   if (unknown.length > 0) {

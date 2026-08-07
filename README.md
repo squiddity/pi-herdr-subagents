@@ -73,12 +73,13 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 5 main-session tools + 3 commands, plus 1 subagent-only tool:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_interrupt` | Complete a safely waiting Pi child, or interrupt its active turn                           |
+| `subagent_snooze` | Schedule one additional notification for a waiting generation (nonblocking)                 |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
@@ -253,6 +254,8 @@ subagent({ name: "Source worker", task: "Test local changes", extensionMode: "ex
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `autoExit`             | boolean | agent setting or `true` for bare spawns | Host-controlled exit after a settled turn. Tracked descendants defer exit until their results are delivered and processed, so recursive orchestrators can keep this enabled. Claude-backed spawns reject this override. |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of effective `autoExit`. |
+| `waitTimeout`          | `immediate`, integer seconds, or `off` | disabled | One-shot parent notification for a waiting generation. Precedence is per-spawn override → named profile → disabled. |
+| `waitTimeoutMessage`   | `none`, `preview`, or `full` | `preview` | Per-spawn override for the message included in waiting notifications. |
 | `model`                | string  | agent, configured, or parent | Exact authenticated `provider/model-id`; resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | agent or parent | Pi thinking level (`off` through `max`); resolution is tool argument → agent frontmatter → parent |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
@@ -284,6 +287,21 @@ By default, a child that is safely waiting after a completed turn is completed t
 Active or blocked children receive Escape and remain open. Aborted, errored, partial, stale, active, or descendant-blocked turns are not promoted into completed results. Set `finish: false` to always use explicit turn-level Escape behavior; this does not fabricate a result or forcibly terminate the session. Repeated completion requests for the same waiting generation are idempotent, while new activity invalidates stale requests.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
+
+### Waiting notifications and snooze
+
+Waiting notifications are disabled unless explicitly configured. Set `wait-timeout: immediate`, a bounded number of seconds, or `off` in named-agent frontmatter; `waitTimeout` overrides it per spawn. Each waiting generation is identified by the child id, activity sequence, and turn index, and produces at most one initial steer. Failed delivery remains retryable, while new activity invalidates the old notification.
+
+Notifications never send Escape or complete the child. The bounded `preview`/`full` message policy only includes the latest final assistant text when available. Use `subagent_snooze({ id, seconds })` to replace the current generation's pending reminder with one additional notification; it is one-shot, nonperiodic, and invalidated by resume or completion. Use `cancel: true` to cancel it. A safe completed answer can be accepted with `subagent_interrupt({ id })`.
+
+```yaml
+---
+name: planner
+interactive: true
+wait-timeout: immediate
+wait-timeout-message: preview
+---
+```
 
 ---
 
@@ -393,6 +411,8 @@ You are a specialized agent that does X...
 | `allowed-child-agents` | string | Comma-separated exact frontmatter names this agent may launch; an empty value denies all named children                                                                                              |
 | `auto-exit`   | boolean | Host-controlled shutdown after a settled turn — no `subagent_done` call needed. Active tracked descendants defer shutdown until their results are delivered and processed. Recommended for autonomous agents and recursive orchestrators; not for interactive agents (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
+| `wait-timeout` | `immediate`, integer seconds, or `off` | disabled | One-shot parent notification after a manual child reaches a waiting generation. Values are bounded to 1–604800 seconds. |
+| `wait-timeout-message` | `none`, `preview`, or `full` | `preview` | Whether to include the latest final assistant message in the waiting steer; text is strictly capped. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
 
@@ -489,7 +509,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagent_snooze`, `subagents_list`, `subagent_resume`):
 
 ```yaml
 ---
