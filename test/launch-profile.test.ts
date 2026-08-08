@@ -13,6 +13,8 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
   buildResumeProfileLaunch,
+  compareToolProfile,
+  formatToolProfileEvidence,
   getLaunchProfilePath,
   MAX_PROFILE_BYTES,
   readLaunchProfile,
@@ -149,6 +151,48 @@ describe("Pi subagent launch profiles", () => {
       );
       assert.equal(existsSync(getLaunchProfilePath(session)), false);
     });
+  });
+
+  it("compares active tools and deny telemetry with the preserved policy", () => {
+    const exact = compareToolProfile(
+      profile,
+      ["subagent_done", "read", "bash"],
+      ["subagent_resume", "subagent"],
+    );
+    assert.equal(exact.status, "exact");
+    assert.deepEqual(exact.expected, ["bash", "read", "subagent_done"]);
+    assert.match(formatToolProfileEvidence(exact), /post-deny launch allowlist/);
+
+    const missingTelemetry = compareToolProfile(profile, ["read"]);
+    assert.equal(missingTelemetry.status, "unverified");
+    assert.match(formatToolProfileEvidence(missingTelemetry), /telemetry are required/);
+
+    const denyDrift = compareToolProfile(profile, ["read"], ["subagent"]);
+    assert.equal(denyDrift.status, "mismatch");
+    assert.deepEqual(denyDrift.deniedMissing, ["subagent_resume"]);
+
+    const deniedActive = compareToolProfile(
+      profile,
+      ["read", "subagent"],
+      ["subagent", "subagent_resume"],
+    );
+    assert.equal(deniedActive.status, "mismatch");
+    assert.deepEqual(deniedActive.activeDenied, ["subagent"]);
+    assert.match(formatToolProfileEvidence(deniedActive), /denied-active/);
+  });
+
+  it("calls a no-allowlist profile unrestricted only after matching deny checks", () => {
+    const unrestrictedProfile = { ...profile, toolAllowlist: null };
+    assert.equal(compareToolProfile(unrestrictedProfile, ["read"]).status, "unverified");
+    assert.equal(
+      compareToolProfile(unrestrictedProfile, ["read"], ["subagent", "subagent_resume"]).status,
+      "unrestricted",
+    );
+    assert.equal(
+      compareToolProfile(unrestrictedProfile, ["read", "subagent"], ["subagent", "subagent_resume"]).status,
+      "mismatch",
+    );
+    assert.equal(compareToolProfile(null, ["read"], []).status, "unverified");
   });
 
   it("reconstructs an absolute resume command and policy environment", () => {
