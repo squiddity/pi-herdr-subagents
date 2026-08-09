@@ -243,7 +243,8 @@ export default function (pi: ExtensionAPI) {
     ctx.shutdown();
   }
 
-  // Show widget + status bar on session start
+  // Show widget + status bar on session start. Active tools are captured later
+  // at before_agent_start, after every startup handler has run.
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
     const tools = pi.getAllTools();
@@ -265,9 +266,12 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", (_event, ctx) => {
     waitingEvidence = { outcome: undefined, hasAssistantText: false, turnIndex: currentTurnIndex };
+    toolNames = pi.getActiveTools().slice().sort();
+    recorder.toolTelemetry(toolNames, denied);
     recorder.beforeAgentStart();
+    renderWidget(ctx, null);
   });
 
   pi.on("agent_start", () => {
@@ -348,6 +352,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("message_update", (event) => {
     recorder.messageUpdate((event as any).assistantMessageEvent?.type);
+  });
+
+  pi.on("message_end", (event) => {
+    recorder.messageEnd((event as any).message);
   });
 
   pi.on("tool_execution_start", (event) => {

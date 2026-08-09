@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -45,10 +45,13 @@ import {
 } from "./extension-runtime.ts";
 import {
   buildResumeProfileLaunch,
+  compareToolProfile,
+  formatToolProfileEvidence,
   readLaunchProfile,
   writeLaunchProfile,
   type LaunchProfileReadResult,
   type SubagentLaunchProfile,
+  type ToolProfileEvidence,
 } from "./launch-profile.ts";
 import { assertRegularFile, UnsafeFileError } from "./safe-file.ts";
 import {
@@ -716,6 +719,29 @@ function resolveResultPresentation(
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
 }
 
+function completionIdentityDetails(runningChildId: string, sessionFile: string): {
+  runningChildId: string;
+  sessionId: string;
+} {
+  return {
+    runningChildId,
+    sessionId: basename(sessionFile, ".jsonl"),
+  };
+}
+
+function appendHostEvidence(presentation: string, running: RunningSubagent): string {
+  const identity = completionIdentityDetails(running.id, running.sessionFile);
+  const lines = [
+    presentation,
+    `Host identity: runningChildId \`${identity.runningChildId}\`; sessionId \`${identity.sessionId}\`.`,
+  ];
+  if (running.runtimePlan?.runtimeMismatch) {
+    lines.push(`Runtime warning: ${running.runtimePlan.runtimeMismatch}`);
+  }
+  if (running.toolProfile) lines.push(formatToolProfileEvidence(running.toolProfile));
+  return lines.join("\n\n");
+}
+
 /**
  * Result from running a single subagent.
  */
@@ -773,6 +799,10 @@ interface RunningSubagent {
   interactive: boolean;
   /** Parent-resolved model/thinking selection and provenance. */
   runtimePlan: ResolvedRuntimePlan | undefined;
+  /** The bounded launch policy preserved for this Pi child. */
+  launchProfile?: SubagentLaunchProfile;
+  launchProfilePath?: string;
+  toolProfile?: ToolProfileEvidence;
   /** Registry owned by this process's parent; contains this running child. */
   parentDescendantRegistryPath?: string;
   /** Registry owned by this child; completion must fail closed while it is nonempty. */
@@ -1711,6 +1741,8 @@ export const __test__ = {
   requestWaitingSubagentCompletion,
   handleSubagentInterrupt,
   resolveResultPresentation,
+  completionIdentityDetails,
+  appendHostEvidence,
   resolveResumeLaunchBehavior,
   resolveResumeSessionPath,
   assertAutoExitOverrideSupported,
@@ -1809,8 +1841,10 @@ async function launchSubagent(
   // Write the profile before creating a pane or starting a process. Claude
   // launches intentionally remain outside this Pi-only policy-preservation
   // contract.
+  let launchProfile: SubagentLaunchProfile | undefined;
+  let launchProfilePath: string | undefined;
   if (childBackend === "pi") {
-    writeLaunchProfile(subagentSessionFile, {
+    launchProfile = {
       version: 1,
       model: runtimePlan.model,
       thinking: effectiveThinking,
@@ -1825,7 +1859,8 @@ async function launchSubagent(
       allowedChildAgents: agentDefs?.allowedChildAgents ?? null,
       waitTimeout: effectiveWaitTimeout,
       waitTimeoutMessage: effectiveWaitTimeoutMessage,
-    });
+    };
+    launchProfilePath = writeLaunchProfile(subagentSessionFile, launchProfile);
   }
 
   // Use pre-created surface (parallel mode) or create a new one.
@@ -2111,6 +2146,8 @@ async function launchSubagent(
     childDescendantRegistryPath: childRegistryPath,
     interactive: effectiveInteractive,
     runtimePlan,
+    launchProfile,
+    launchProfilePath,
     parentDescendantRegistryPath: parentRegistryPath,
     lifecycle: createLifecycle(startTime),
   };
@@ -2170,6 +2207,16 @@ async function watchSubagent(
 
     const detectedAt = Date.now();
     running.lifecycle = markCompletionDetected(running.lifecycle, result, detectedAt);
+    if (running.cli !== "claude") {
+      // Refresh synchronously so terminal details include the final usage and
+      // tool-policy snapshot, not the last polling tick's stale state.
+      refreshCompletionActivity(running, detectedAt);
+      running.toolProfile = compareToolProfile(
+        running.launchProfile ?? null,
+        running.activity?.actualTools,
+        running.activity?.deniedTools,
+      );
+    }
     updateWidget();
     const elapsed = Math.floor((detectedAt - startTime) / 1000);
 
@@ -2484,9 +2531,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const basePresentation = resolveResultPresentation(result, running.name);
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
-              : basePresentation;
+            const presentation = appendHostEvidence(basePresentation, running);
 
             completionApi.sendMessage(
               {
@@ -2500,9 +2545,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  ...completionIdentityDetails(running.id, result.sessionFile ?? running.sessionFile),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
+                  ...(running.launchProfilePath ? { launchProfilePath: running.launchProfilePath } : {}),
+                  ...(running.launchProfile ? { allowedChildAgents: running.launchProfile.allowedChildAgents ?? null } : {}),
+                  ...(running.toolProfile ? { toolProfile: running.toolProfile } : {}),
+                  ...(running.activity?.usage ? { usage: running.activity.usage } : {}),
+                  ...(running.activity?.usageByModel ? { usageByModel: running.activity.usageByModel } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -3031,6 +3082,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           childDescendantRegistryPath: childRegistryPath,
           interactive,
           runtimePlan: runtimePlanFromLaunchProfile(launchProfile),
+          launchProfile,
+          launchProfilePath: profileRead.path,
           parentDescendantRegistryPath: parentRegistryPath,
           lifecycle: createLifecycle(startTime),
         };
@@ -3086,9 +3139,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               { ...result, summary, sessionFile: sessionPath },
               name,
             );
-            const presentation = running.runtimePlan?.runtimeMismatch
-              ? `${basePresentation}\n\nRuntime warning: ${running.runtimePlan.runtimeMismatch}`
-              : basePresentation;
+            const presentation = appendHostEvidence(basePresentation, running);
 
             completionApi.sendMessage(
               {
@@ -3101,8 +3152,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: sessionPath,
+                  ...completionIdentityDetails(running.id, sessionPath),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(running.runtimePlan ? { runtimePlan: running.runtimePlan } : {}),
+                  launchProfilePath: running.launchProfilePath,
+                  profileStatus: "preserved",
+                  ...(running.toolProfile ? { toolProfile: running.toolProfile } : {}),
+                  ...(running.activity?.usage ? { usage: running.activity.usage } : {}),
+                  ...(running.activity?.usageByModel ? { usageByModel: running.activity.usageByModel } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },

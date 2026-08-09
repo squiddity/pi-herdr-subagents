@@ -65,6 +65,20 @@ export interface ResumeProfileLaunch {
   env: Record<string, string>;
 }
 
+export interface ToolProfileEvidence {
+  status: "exact" | "mismatch" | "unrestricted" | "unverified";
+  expected: string[] | null;
+  actual?: string[];
+  expectedDenied?: string[];
+  actualDenied?: string[];
+  missing?: string[];
+  unexpected?: string[];
+  deniedMissing?: string[];
+  deniedUnexpected?: string[];
+  activeDenied?: string[];
+  reason?: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
@@ -292,4 +306,96 @@ export function buildResumeProfileLaunch(
       PI_SUBAGENT_AGENT: validated.agent ?? "",
     },
   };
+}
+
+function normalizedSet(values: string[]): string[] {
+  return [...new Set(values)].sort();
+}
+
+export function compareToolProfile(
+  profile: SubagentLaunchProfile | null,
+  actualTools?: string[],
+  deniedTools?: string[],
+): ToolProfileEvidence {
+  const actual = actualTools ? normalizedSet(actualTools) : undefined;
+  const actualDenied = deniedTools ? normalizedSet(deniedTools) : undefined;
+  if (!profile) {
+    return {
+      status: "unverified",
+      expected: null,
+      actual,
+      actualDenied,
+      reason: "no preserved launch profile was applied",
+    };
+  }
+
+  const expectedDenied = normalizedSet(profile.deniedTools);
+  const expected = profile.toolAllowlist === null
+    ? null
+    : normalizedSet(profile.toolAllowlist.filter((name) => !expectedDenied.includes(name)));
+  if (!actual || !actualDenied) {
+    return {
+      status: "unverified",
+      expected,
+      actual,
+      expectedDenied,
+      actualDenied,
+      reason: "child tool and deny telemetry are required",
+    };
+  }
+
+  const actualSet = new Set(actual);
+  const expectedDeniedSet = new Set(expectedDenied);
+  const actualDeniedSet = new Set(actualDenied);
+  const deniedMissing = expectedDenied.filter((name) => !actualDeniedSet.has(name));
+  const deniedUnexpected = actualDenied.filter((name) => !expectedDeniedSet.has(name));
+  const activeDenied = actual.filter((name) => expectedDeniedSet.has(name) || actualDeniedSet.has(name));
+  if (deniedMissing.length || deniedUnexpected.length || activeDenied.length) {
+    return {
+      status: "mismatch",
+      expected,
+      actual,
+      expectedDenied,
+      actualDenied,
+      ...(deniedMissing.length ? { deniedMissing } : {}),
+      ...(deniedUnexpected.length ? { deniedUnexpected } : {}),
+      ...(activeDenied.length ? { activeDenied } : {}),
+    };
+  }
+
+  if (expected === null) {
+    return { status: "unrestricted", expected: null, actual, expectedDenied, actualDenied };
+  }
+  const expectedSet = new Set(expected);
+  const missing = expected.filter((name) => !actualSet.has(name));
+  const unexpected = actual.filter((name) => !expectedSet.has(name));
+  return {
+    status: missing.length === 0 && unexpected.length === 0 ? "exact" : "mismatch",
+    expected,
+    actual,
+    expectedDenied,
+    actualDenied,
+    ...(missing.length ? { missing } : {}),
+    ...(unexpected.length ? { unexpected } : {}),
+  };
+}
+
+export function formatToolProfileEvidence(evidence: ToolProfileEvidence): string {
+  if (evidence.status === "exact") {
+    return `Tool profile: exact (${evidence.actual?.length ?? 0} observed tools match the post-deny launch allowlist).`;
+  }
+  if (evidence.status === "unrestricted") {
+    return `Tool profile: unrestricted (no --tools allowlist after matching deny checks; ${evidence.actual?.length ?? 0} tools observed).`;
+  }
+  if (evidence.status === "unverified") {
+    return `Tool profile: unverified (${evidence.reason ?? "insufficient host evidence"}).`;
+  }
+  const details = [
+    evidence.missing?.length ? `missing=[${evidence.missing.join(", ")}]` : "",
+    evidence.unexpected?.length ? `unexpected=[${evidence.unexpected.join(", ")}]` : "",
+    evidence.deniedMissing?.length ? `deny-missing=[${evidence.deniedMissing.join(", ")}]` : "",
+    evidence.deniedUnexpected?.length ? `deny-unexpected=[${evidence.deniedUnexpected.join(", ")}]` : "",
+    evidence.activeDenied?.length ? `denied-active=[${evidence.activeDenied.join(", ")}]` : "",
+  ].filter(Boolean).join(" ");
+  return `Tool profile: mismatch.${details ? ` ${details}` : ""}`;
 }

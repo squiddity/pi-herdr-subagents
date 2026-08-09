@@ -322,6 +322,18 @@ Tracked `subagent_resume` requires the session's adjacent `<session>.profile.jso
 
 External, manually created, or older sessions can still be resumed directly with `pi --session <path>`, but they do not receive tracked policy-preserving `subagent_resume` behavior.
 
+### Completion telemetry
+
+Pi-backed child completion details include bounded, content-free telemetry from the activity sidecar:
+
+- `toolProfile` compares the preserved tool/deny policy with active tools captured after startup and reports `exact`, `mismatch`, `unrestricted`, or `unverified` evidence.
+- `usage` reports cumulative tracked-run sessions, turns, assistant responses, provider-reported token categories, and provider-reported cost.
+- `usageByModel` provides the same provider-reported metrics in at most 64 provider/model buckets.
+- `runningChildId` identifies the tracked launch, while `sessionId` identifies its resumable session file across initial and resumed completion paths; both also appear in the human-readable host-identity line.
+- Initial completions expose `launchProfilePath` and `allowedChildAgents`; resumed completions expose `launchProfilePath` and `profileStatus: "preserved"`.
+
+Unavailable metrics remain `null` and are never estimated. Prompt, response, reasoning, credential, and permission content is not persisted. This is observational telemetry, not sandboxing, provenance, billing verification, or cross-child aggregation. Reopening the same activity sidecar (for example across child extension reload) preserves its cumulative totals; a separately tracked `subagent_resume` launch starts a new activity sidecar.
+
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)

@@ -56,6 +56,7 @@ import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
+  MAX_ACTIVITY_FILE_BYTES,
 } from "../pi-extension/subagents/activity.ts";
 import {
   childDescendantRegistryPath,
@@ -1783,6 +1784,51 @@ describe("subagent-done.ts", () => {
     }
   });
 
+  it("captures active tools after startup handlers before the first agent turn", async () => {
+    const dir = createTestDir();
+    const activityFile = join(dir, "activity.json");
+    const previousId = process.env.PI_SUBAGENT_ID;
+    const previousActivity = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+    const previousDenied = process.env.PI_DENY_TOOLS;
+    process.env.PI_SUBAGENT_ID = "telemetry-child";
+    process.env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+    process.env.PI_DENY_TOOLS = "subagent_resume,subagent";
+    let activeTools = ["read", "write"];
+    const handlers = new Map<string, Function[]>();
+    try {
+      subagentDoneExtension({
+        on(event: string, handler: Function) {
+          handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+        },
+        registerShortcut() {},
+        registerTool() {},
+        getAllTools() {
+          return [{ name: "read" }, { name: "write" }];
+        },
+        getActiveTools() {
+          return activeTools;
+        },
+      } as any);
+      const ctx = {
+        sessionManager: { appendCustomEntry() {} },
+        ui: { setWidget() {} },
+      };
+      await handlers.get("session_start")?.[0]({}, ctx);
+      activeTools = ["read"];
+      await handlers.get("before_agent_start")?.[0]({}, ctx);
+
+      const result = readSubagentActivityFile(activityFile, "telemetry-child");
+      assert.ok(result.ok);
+      assert.deepEqual(result.activity.actualTools, ["read"]);
+      assert.deepEqual(result.activity.deniedTools, ["subagent", "subagent_resume"]);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_ID", previousId);
+      restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", previousActivity);
+      restoreEnvVar("PI_DENY_TOOLS", previousDenied);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -2777,10 +2823,13 @@ describe("subagent activity snapshots", () => {
       });
 
       recorder.sessionStart();
+      recorder.toolTelemetry(["write", "read", "read"], ["subagent_resume", "subagent"]);
       recorder.toolExecutionStart("tool-1", "bash");
 
       const read = readSubagentActivityFile(activityFile, "child-1");
       assert.ok(read.ok);
+      assert.deepEqual(read.activity.actualTools, ["read", "write"]);
+      assert.deepEqual(read.activity.deniedTools, ["subagent", "subagent_resume"]);
       assert.equal(read.activity.phase, "active");
       assert.equal(read.activity.activeScope, "tool");
       assert.equal(read.activity.toolName, "bash");
@@ -2789,6 +2838,143 @@ describe("subagent activity snapshots", () => {
         ok: false,
         reason: "wrong-id",
       });
+    });
+  });
+
+  it("records provider usage without persisting message content", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "usage-child");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "usage-child",
+        activityFile,
+        now: () => 1_000,
+      });
+
+      recorder.sessionStart();
+      recorder.turnStart(1);
+      recorder.messageEnd({
+        role: "assistant",
+        provider: "openai-codex",
+        model: "gpt-test",
+        secretPrompt: "must not be persisted",
+        content: "assistant content must not be persisted",
+        usage: {
+          input: 10,
+          output: 7,
+          cacheRead: 3,
+          cacheWrite: 2,
+          reasoning: 4,
+          totalTokens: 20,
+          cost: { input: 1, output: 2, cacheRead: 0.3, cacheWrite: 0.2, total: 3.5 },
+        },
+      });
+      recorder.messageEnd({ role: "user", content: "also not persisted" });
+
+      const read = readSubagentActivityFile(activityFile, "usage-child");
+      assert.ok(read.ok);
+      assert.deepEqual(read.activity.usage, {
+        version: 1,
+        sessions: 1,
+        turns: 1,
+        responses: 1,
+        inputTokens: 10,
+        outputTokens: 7,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
+        reasoningTokens: 4,
+        totalTokens: 20,
+        cost: { input: 1, output: 2, cacheRead: 0.3, cacheWrite: 0.2, total: 3.5 },
+      });
+      assert.deepEqual(read.activity.usageByModel, [{
+        version: 1,
+        provider: "openai-codex",
+        model: "gpt-test",
+        responses: 1,
+        inputTokens: 10,
+        outputTokens: 7,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
+        reasoningTokens: 4,
+        totalTokens: 20,
+        cost: { input: 1, output: 2, cacheRead: 0.3, cacheWrite: 0.2, total: 3.5 },
+      }]);
+      const serialized = JSON.stringify(read.activity);
+      assert.equal(serialized.includes("secretPrompt"), false);
+      assert.equal(serialized.includes("assistant content"), false);
+      assert.equal(serialized.includes("also not persisted"), false);
+    });
+  });
+
+  it("preserves cumulative usage when the same tracked activity file is reopened", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "continued-child");
+      const first = createSubagentActivityRecorder({
+        runningChildId: "continued-child",
+        activityFile,
+        now: () => 1_000,
+      });
+      first.sessionStart();
+      first.turnStart(1);
+      first.messageEnd({
+        role: "assistant",
+        provider: "provider-a",
+        model: "model-a",
+        usage: { input: 2, output: 3, totalTokens: 5, cost: { total: 0 } },
+      });
+
+      const continued = createSubagentActivityRecorder({
+        runningChildId: "continued-child",
+        activityFile,
+        now: () => 2_000,
+      });
+      continued.sessionStart();
+      continued.turnStart(2);
+      continued.messageEnd({
+        role: "assistant",
+        provider: "provider-a",
+        model: "model-a",
+        usage: { input: 4, output: 5, totalTokens: 9, cost: { total: 0 } },
+      });
+
+      const read = readSubagentActivityFile(activityFile, "continued-child");
+      assert.ok(read.ok);
+      assert.equal(read.activity.usage.sessions, 2);
+      assert.equal(read.activity.usage.turns, 2);
+      assert.equal(read.activity.usage.responses, 2);
+      assert.equal(read.activity.usage.inputTokens, 6);
+      assert.equal(read.activity.usage.totalTokens, 14);
+      assert.equal(read.activity.usage.cacheReadTokens, null);
+      assert.equal(read.activity.usageByModel[0]?.responses, 2);
+    });
+  });
+
+  it("refreshes the final activity sidecar before completion details are constructed", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "completion-usage-child");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "completion-usage-child",
+        activityFile,
+        now: () => 2_000,
+      });
+      recorder.sessionStart();
+      recorder.messageEnd({
+        role: "assistant",
+        provider: "provider-a",
+        model: "model-a",
+        usage: { input: 11, output: 7, totalTokens: 18, cost: { total: 0.35 } },
+      });
+
+      const running = {
+        id: "completion-usage-child",
+        cli: "pi",
+        startTime: 1_000,
+        activityFile,
+        lifecycle: createLifecycle(1_000),
+      } as any;
+      assert.equal(running.activity, undefined);
+      subagentsModule.refreshCompletionActivity(running, 2_001);
+      assert.equal(running.activity?.usage?.totalTokens, 18);
+      assert.equal(running.activity?.usageByModel?.[0]?.responses, 1);
     });
   });
 
@@ -2845,6 +3031,37 @@ describe("subagent activity snapshots", () => {
         assert.equal(read.ok, false);
         assert.equal((read as { ok: false; reason: string }).reason, "invalid");
       }
+    });
+  });
+
+  it("rejects symlink, FIFO, directory, and oversized activity files without blocking", () => {
+    withTempDir((dir) => {
+      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+      const activityFile = getSubagentActivityFile(dir, "special");
+      const target = join(dir, "target-activity.json");
+      writeFileSync(target, "{}\n");
+      symlinkSync(target, activityFile);
+      let read = readSubagentActivityFile(activityFile, "special");
+      assert.equal(read.ok, false);
+      assert.match((read as { ok: false; error?: string }).error ?? "", /symbolic link/);
+      rmSync(activityFile);
+
+      mkdirSync(activityFile);
+      read = readSubagentActivityFile(activityFile, "special");
+      assert.equal(read.ok, false);
+      assert.match((read as { ok: false; error?: string }).error ?? "", /regular file/);
+      rmSync(activityFile, { recursive: true });
+
+      execFileSync("mkfifo", [activityFile]);
+      read = readSubagentActivityFile(activityFile, "special");
+      assert.equal(read.ok, false);
+      assert.match((read as { ok: false; error?: string }).error ?? "", /regular file/);
+      rmSync(activityFile);
+
+      writeFileSync(activityFile, Buffer.alloc(MAX_ACTIVITY_FILE_BYTES + 1, 0x20));
+      read = readSubagentActivityFile(activityFile, "special");
+      assert.equal(read.ok, false);
+      assert.match((read as { ok: false; error?: string }).error ?? "", /byte limit/);
     });
   });
 
@@ -3362,6 +3579,33 @@ describe("subagent interruption", () => {
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+
+  it("builds stable structured completion identifiers", () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    assert.deepEqual(
+      testApi.completionIdentityDetails(
+        "child-run-7",
+        "/tmp/sessions/2026-08-09T01-02-03-004Z_child-session-7.jsonl",
+      ),
+      {
+        runningChildId: "child-run-7",
+        sessionId: "2026-08-09T01-02-03-004Z_child-session-7",
+      },
+    );
+  });
+
+  it("adds host identity prose without dropping runtime warnings", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.appendHostEvidence("Completed.", {
+      id: "child-run-7",
+      sessionFile: "/tmp/sessions/child-session-7.jsonl",
+      runtimePlan: { runtimeMismatch: "provider/model drift" },
+    });
+
+    assert.match(presentation, /Host identity: runningChildId `child-run-7`; sessionId `child-session-7`\./);
+    assert.match(presentation, /Runtime warning: provider\/model drift/);
   });
 });
 
