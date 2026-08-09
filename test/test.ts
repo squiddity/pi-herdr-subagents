@@ -969,6 +969,72 @@ describe("model configuration", () => {
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  it("fails closed for an unknown explicit profile instead of returning bare defaults", async () => {
+    await withIsolatedAgentEnv(async () => {
+      assert.throws(
+        () => testApi.resolveExplicitAgentDefaults("proposer"),
+        new Error('Unknown named subagent profile "proposer"'),
+      );
+      assert.equal(testApi.loadAgentDefaults("proposer"), null);
+    });
+  });
+
+  it("parses an exact child-profile allowlist, including an explicit empty policy", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "allowlist-test-agent",
+        [
+          "name: allowlist-test-agent",
+          "allowed-child-agents: mem-import-extractor, mem-import-proposer",
+        ].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "empty-allowlist-test-agent",
+        [
+          "name: empty-allowlist-test-agent",
+          "allowed-child-agents:",
+        ].join("\n"),
+      );
+
+      assert.deepEqual(
+        testApi.loadAgentDefaults("allowlist-test-agent")?.allowedChildAgents,
+        ["mem-import-extractor", "mem-import-proposer"],
+      );
+      assert.deepEqual(
+        testApi.loadAgentDefaults("empty-allowlist-test-agent")?.allowedChildAgents,
+        [],
+      );
+    });
+  });
+
+  it("enforces the host-provided child-profile policy before launch", () => {
+    const previous = process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS;
+    try {
+      delete process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS;
+      assert.doesNotThrow(() => testApi.assertAllowedChildAgent("reviewer"));
+
+      process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS = JSON.stringify(["mem-import-extractor"]);
+      assert.doesNotThrow(() => testApi.assertAllowedChildAgent("mem-import-extractor"));
+      assert.throws(
+        () => testApi.assertAllowedChildAgent("reviewer"),
+        /Child profile "reviewer" is not allowed/,
+      );
+      assert.throws(
+        () => testApi.assertAllowedChildAgent(undefined),
+        /requires an explicit allowed child profile/,
+      );
+
+      process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS = "[]";
+      assert.throws(() => testApi.assertAllowedChildAgent("anything"), /not allowed/);
+      process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS = "not-json";
+      assert.throws(() => testApi.assertAllowedChildAgent("anything"), /not allowed/);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_ALLOWED_CHILD_AGENTS", previous);
+    }
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -2051,6 +2117,11 @@ describe("tool registration", () => {
         /researcher.*Researches external topics using authoritative sources/,
       );
       assert.match(guidance, /omit.*model.*thinking.*named agent.*defaults/i);
+      assert.match(guidance, /caller supplies.*exact named-profile key.*absent.*visible catalog/i);
+      assert.match(
+        subagent.parameters.properties.agent.description,
+        /caller-supplied key.*hidden.*visible catalog/i,
+      );
       assert.match(
         subagent.parameters.properties.thinking.description,
         /named agent's thinking default/i,

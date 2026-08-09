@@ -104,6 +104,7 @@ function buildSubagentRoutingGuidelines(
 ): string[] {
   return [
     "Choose the named agent whose description most closely matches the task; do not use one agent as a generic default.",
+    "If the caller supplies an exact named-profile key, use it even when it is absent from the visible catalog; hidden profiles remain directly invokable and unknown keys fail before launch.",
     "Omit model and thinking when invoking a named agent so its configured defaults apply. Passing either field is an explicit one-off override and takes precedence over agent frontmatter.",
     "For a bare spawn, omit model and thinking to inherit the parent runtime.",
     "When an intentional runtime override is necessary, prefer changing thinking before changing models: minimal/low for bounded mechanical work, medium for ordinary implementation or review, and high+ for architecture, concurrency, security, or hard diagnosis.",
@@ -129,7 +130,7 @@ const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from the available named subagent catalog. Agent frontmatter can provide model, thinking, tools, skills, and role instructions.",
+        "Exact frontmatter name to load. Use a caller-supplied key even when it is hidden from the visible catalog; display names never select profiles and unknown keys fail before launch. Agent frontmatter can provide model, thinking, tools, skills, and role instructions.",
     }),
   ),
   systemPrompt: Type.Optional(
@@ -190,6 +191,8 @@ interface AgentDefaults {
   cwd?: string;
   cli?: string;
   body?: string;
+  /** Exact named profiles this profile may launch; undefined means unrestricted. */
+  allowedChildAgents?: string[];
   disableModelInvocation?: boolean;
 }
 
@@ -265,6 +268,15 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
   return undefined;
 }
 
+function parseAllowedChildAgents(frontmatter: string): string[] | undefined {
+  const match = frontmatter.match(/^allowed-child-agents:\s*(.*)$/m);
+  if (!match) return undefined;
+  return match[1]!
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
@@ -294,6 +306,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
     body: body || undefined,
+    allowedChildAgents: parseAllowedChildAgents(frontmatter),
     disableModelInvocation:
       getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
   };
@@ -454,6 +467,47 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   // to the same definition here — even when an agent's frontmatter `name`
   // differs from its filename.
   return discoverAgentDefinitions().find((agent) => agent.name === agentName) ?? null;
+}
+
+/**
+ * Resolve an explicitly requested profile before any launch side effects.
+ * An omitted agent intentionally means a bare spawn; an unresolved explicit
+ * key is a configuration error and must never fall through to that behavior.
+ */
+function resolveExplicitAgentDefaults(agentName: string): AgentDefaults {
+  const agentDefs = loadAgentDefaults(agentName);
+  if (!agentDefs) {
+    throw new Error(`Unknown named subagent profile "${agentName}"`);
+  }
+  return agentDefs;
+}
+
+function readAllowedChildAgents(): string[] | null | undefined {
+  const raw = process.env.PI_SUBAGENT_ALLOWED_CHILD_AGENTS;
+  if (raw === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null) return null;
+    if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== "string" || value.length === 0)) {
+      return [];
+    }
+    return [...new Set(parsed)];
+  } catch {
+    // A malformed host-provided policy must fail closed rather than broaden
+    // the child launch surface.
+    return [];
+  }
+}
+
+function assertAllowedChildAgent(agentName: string | undefined): void {
+  const allowed = readAllowedChildAgents();
+  if (allowed == null) return;
+  if (agentName === undefined) {
+    throw new Error("This named subagent profile requires an explicit allowed child profile");
+  }
+  if (!allowed.includes(agentName)) {
+    throw new Error(`Child profile "${agentName}" is not allowed by the active parent profile`);
+  }
 }
 
 function formatElapsed(seconds: number): string {
@@ -1091,6 +1145,9 @@ export const __test__ = {
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
+  resolveExplicitAgentDefaults,
+  readAllowedChildAgents,
+  assertAllowedChildAgent,
   discoverAgentDefinitions,
   buildAvailableAgentCatalog,
   resolveEffectiveSessionMode,
@@ -1144,7 +1201,10 @@ async function launchSubagent(
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  assertAllowedChildAgent(params.agent);
+  const agentDefs = params.agent !== undefined
+    ? resolveExplicitAgentDefaults(params.agent)
+    : null;
   if (!ctx.model) throw new Error("Subagent launch requires a resolved parent model");
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
@@ -1360,6 +1420,7 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellQuote(params.agent)}`);
   }
+  envParts.push(`PI_SUBAGENT_ALLOWED_CHILD_AGENTS=${shellQuote(JSON.stringify(agentDefs?.allowedChildAgents ?? null))}`);
   if (effectiveAutoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
   }
