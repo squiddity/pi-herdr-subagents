@@ -1074,6 +1074,68 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("loads and resolves named-profile waiting timeout policy with spawn precedence", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "waiting-profile-test-agent",
+        [
+          "name: waiting-profile-test-agent",
+          "auto-exit: false",
+          "interactive: true",
+          "wait-timeout: 45",
+          "wait-timeout-message: full",
+        ].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "waiting-off-test-agent",
+        ["name: waiting-off-test-agent", "wait-timeout: off"].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "waiting-immediate-test-agent",
+        [
+          "name: waiting-immediate-test-agent",
+          "wait-timeout: immediate",
+          "wait-timeout-message: preview",
+        ].join("\n"),
+      );
+
+      const configured = testApi.loadAgentDefaults("waiting-profile-test-agent");
+      assert.equal(configured?.waitTimeout, 45);
+      assert.equal(configured?.waitTimeoutMessage, "full");
+      assert.equal(testApi.resolveEffectiveWaitTimeout({ name: "A", task: "T" }, configured), 45);
+      assert.equal(testApi.resolveEffectiveWaitTimeoutMessage({ name: "A", task: "T" }, configured), "full");
+      assert.equal(testApi.resolveEffectiveWaitTimeout(
+        { name: "A", task: "T", waitTimeout: 10 },
+        configured,
+      ), 10);
+      assert.equal(testApi.resolveEffectiveWaitTimeout(
+        { name: "A", task: "T", waitTimeout: "immediate" },
+        configured,
+      ), "immediate");
+      assert.equal(testApi.resolveEffectiveWaitTimeout(
+        { name: "A", task: "T", waitTimeout: "off" },
+        configured,
+      ), null);
+      assert.equal(testApi.resolveEffectiveWaitTimeoutMessage(
+        { name: "A", task: "T", waitTimeoutMessage: "none" },
+        configured,
+      ), "none");
+
+      const immediate = testApi.loadAgentDefaults("waiting-immediate-test-agent");
+      assert.equal(immediate?.waitTimeout, "immediate");
+      assert.equal(testApi.resolveEffectiveWaitTimeout({ name: "A", task: "T" }, immediate), "immediate");
+
+      const disabled = testApi.loadAgentDefaults("waiting-off-test-agent");
+      assert.equal(disabled?.waitTimeout, null);
+      assert.equal(testApi.resolveEffectiveWaitTimeout({ name: "A", task: "T" }, disabled), null);
+      assert.equal(testApi.resolveEffectiveWaitTimeout({ name: "A", task: "T" }, null), null);
+      assert.equal(testApi.resolveEffectiveWaitTimeoutMessage({ name: "A", task: "T" }, null), "preview");
+    });
+  });
+
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -2507,6 +2569,7 @@ describe("tool registration", () => {
 
     assert.equal(denied.has("subagent"), true);
     assert.equal(denied.has("subagent_interrupt"), true);
+    assert.equal(denied.has("subagent_snooze"), true);
     assert.equal(denied.has("subagent_resume"), true);
   });
 
@@ -2876,6 +2939,15 @@ describe("subagent interruption", () => {
       ...overrides,
     };
   }
+
+  it("registers subagent_snooze and exposes waiting timeout controls", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const snooze = registeredTools.find((tool) => tool.name === "subagent_snooze");
+    assert.ok(snooze, "expected subagent_snooze to be registered");
+    assert.match(snooze.description, /one additional parent notification/);
+    assert.match(snooze.promptSnippet, /nonperiodic|cancel/i);
+  });
 
   it("registers completion-aware subagent_interrupt behavior", () => {
     const { api, registeredTools } = createMockExtensionApi();
@@ -3290,6 +3362,126 @@ describe("subagent interruption", () => {
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+});
+
+describe("waiting-timeout parent supervision", () => {
+  function makeWaitingRunning(params: {
+    dir: string;
+    outcome?: "completed" | "aborted" | "error";
+    hasText?: boolean;
+    waitTimeout?: number | "immediate" | null;
+  }) {
+    const id = "waiting-child";
+    const sessionFile = createSessionFile(params.dir, [
+      SESSION_HEADER,
+      MODEL_CHANGE,
+      USER_MSG,
+      {
+        ...ASSISTANT_MSG,
+        message: {
+          ...ASSISTANT_MSG.message,
+          stopReason: params.outcome === "aborted" ? "aborted" : "stop",
+          content: params.hasText === false ? [] : [{ type: "text", text: "Final timeout answer." }],
+        },
+      },
+    ]);
+    const activityFile = getSubagentActivityFile(params.dir, id);
+    const recorder = createSubagentActivityRecorder({
+      runningChildId: id,
+      activityFile,
+      now: () => 1_000,
+    });
+    recorder.sessionStart();
+    recorder.turnStart(2);
+    recorder.agentEndWaiting({
+      outcome: params.outcome ?? "completed",
+      hasAssistantText: params.hasText !== false,
+    });
+    return {
+      id,
+      name: "Waiting Worker",
+      task: "",
+      surface: "waiting-pane",
+      startTime: 0,
+      sessionFile,
+      activityFile,
+      interactive: true,
+      waitTimeout: params.waitTimeout === undefined ? 1 : params.waitTimeout,
+      waitTimeoutMessage: "preview",
+      lifecycle: createLifecycle(0),
+    } as any;
+  }
+
+  function resetRuntime(testApi: any): void {
+    (testApi.runningSubagents as Map<string, any>).clear();
+    (testApi.waitingTimeoutStates as Map<string, any>).clear();
+  }
+
+  it("emits one generation-bound steer with the available final answer", () => {
+    const testApi = (subagentsModule as any).__test__;
+    resetRuntime(testApi);
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir });
+      const { api, sentMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      try {
+        testApi.runningSubagents.set(running.id, running);
+        testApi.runWaitingTimeoutTick(api, 2_000);
+        testApi.runWaitingTimeoutTick(api, 3_000);
+
+        assert.equal(sentMessages.length, 1);
+        assert.equal(sentMessages[0].message.customType, "subagent_waiting_timeout");
+        assert.match(sentMessages[0].message.content, /Final timeout answer/);
+        assert.match(sentMessages[0].message.content, /subagent_interrupt/);
+        assert.equal(sentMessages[0].message.details.safelyCompletable, true);
+        assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+      } finally {
+        resetRuntime(testApi);
+      }
+    });
+  });
+
+  it("retries failed delivery and emits one replacement snooze without Escape", () => {
+    const testApi = (subagentsModule as any).__test__;
+    resetRuntime(testApi);
+    withTempDir((dir) => {
+      const running = makeWaitingRunning({ dir, waitTimeout: "immediate" });
+      const { api, eventHandlers } = createMockExtensionApi();
+      const sent: any[] = [];
+      let attempts = 0;
+      (api as any).sendMessage = (message: any) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("transient send failure");
+        sent.push(message);
+      };
+      (subagentsModule as any).default(api);
+      try {
+        testApi.runningSubagents.set(running.id, running);
+        testApi.runWaitingTimeoutTick(api, 1_000);
+        testApi.runWaitingTimeoutTick(api, 1_001);
+        assert.equal(attempts, 2);
+        assert.equal(sent.length, 1);
+
+        const snooze = withMockedNow(2_000, () =>
+          testApi.handleSubagentSnooze({ id: running.id, seconds: 5 }),
+        );
+        assert.equal(snooze.details.status, "snoozed");
+        testApi.runWaitingTimeoutTick(api, 5_999);
+        assert.equal(sent.length, 1);
+        testApi.runWaitingTimeoutTick(api, 6_000);
+        testApi.runWaitingTimeoutTick(api, 7_000);
+        assert.equal(sent.length, 2);
+        assert.equal(sent[1].message?.customType ?? sent[1].customType, "subagent_waiting_timeout");
+        const snoozeMessage = sent[1].message ?? sent[1];
+        assert.equal(snoozeMessage.details.notificationKind, "snooze");
+      } finally {
+        resetRuntime(testApi);
+        for (const handler of eventHandlers.get("session_shutdown") ?? []) {
+          handler({ reason: "quit" }, {});
+        }
+      }
+    });
   });
 });
 

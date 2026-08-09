@@ -38,6 +38,8 @@ const profile: SubagentLaunchProfile = {
   inheritedExtensionEntries: ["/workspace/tools/example-child-extension.ts"],
   configRoot: "/workspace/child/.pi/agent",
   allowedChildAgents: ["child-reader"],
+  waitTimeout: 120,
+  waitTimeoutMessage: "preview",
 };
 
 function withTempDir(run: (dir: string) => void): void {
@@ -50,7 +52,7 @@ function withTempDir(run: (dir: string) => void): void {
 }
 
 describe("Pi subagent launch profiles", () => {
-  it("round-trips a bounded policy profile", () => {
+  it("round-trips a bounded policy profile including waiting settings", () => {
     withTempDir((dir) => {
       const session = join(dir, "child.jsonl");
       writeFileSync(session, `${JSON.stringify({ type: "session", version: 3 })}\n`);
@@ -58,6 +60,10 @@ describe("Pi subagent launch profiles", () => {
 
       assert.equal(path, `${session}.profile.json`);
       assert.deepEqual(readLaunchProfile(session), { status: "loaded", profile, path });
+
+      const immediate = { ...profile, waitTimeout: "immediate" as const };
+      assert.equal(validateLaunchProfile(immediate).waitTimeout, "immediate");
+      assert.equal(validateLaunchProfile(immediate).waitTimeoutMessage, "preview");
     });
   });
 
@@ -84,6 +90,14 @@ describe("Pi subagent launch profiles", () => {
       assert.throws(
         () => validateLaunchProfile({ ...profile, extensionEntries: ["./relative.ts"] }),
         /must be absolute/,
+      );
+      assert.throws(
+        () => validateLaunchProfile({ ...profile, waitTimeout: 0 }),
+        /waitTimeout must be an integer/,
+      );
+      assert.throws(
+        () => validateLaunchProfile({ ...profile, waitTimeoutMessage: "everything" }),
+        /waitTimeoutMessage must be/,
       );
       assert.throws(
         () => validateLaunchProfile({ ...profile, deniedTools: ["subagent", "subagent"] }),
