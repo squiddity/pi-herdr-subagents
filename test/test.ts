@@ -48,8 +48,15 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
+import {
+  childDescendantRegistryPath,
+  parentDescendantRegistryPath,
+  registerDescendant,
+  unregisterDescendant,
+} from "../pi-extension/subagents/descendant-registry.ts";
 import subagentDoneExtension, {
   shouldMarkUserTookOver,
+  shouldDeferAutoExitForDescendants,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   buildCompletionSidecar,
@@ -1124,6 +1131,30 @@ describe("subagent discovery", () => {
     assert.equal(testApi.resolveEffectiveAutoExit({ name: "A", task: "T" }, null), true);
     assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null), false);
 
+    // A per-spawn override wins over named-agent frontmatter so recursive
+    // orchestrators can remain alive until descendant results arrive.
+    assert.equal(
+      testApi.resolveEffectiveAutoExit(
+        { name: "A", task: "T", autoExit: false },
+        { autoExit: true },
+      ),
+      false,
+    );
+    assert.equal(
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T", autoExit: false },
+        { autoExit: true },
+      ),
+      true,
+    );
+    assert.equal(
+      testApi.resolveEffectiveAutoExit(
+        { name: "A", task: "T", autoExit: true },
+        { autoExit: false },
+      ),
+      true,
+    );
+
     // A bare full-context fork invoked directly through the tool is still an
     // autonomous task. Forking only controls inherited conversation context.
     assert.equal(
@@ -1149,6 +1180,19 @@ describe("subagent discovery", () => {
         null,
       ),
       true,
+    );
+  });
+
+  it("rejects per-spawn autoExit overrides for Claude-backed agents", () => {
+    assert.doesNotThrow(() => testApi.assertAutoExitOverrideSupported("pi", false));
+    assert.doesNotThrow(() => testApi.assertAutoExitOverrideSupported("claude", undefined));
+    assert.throws(
+      () => testApi.assertAutoExitOverrideSupported("claude", false),
+      /supported only for Pi-backed subagents/,
+    );
+    assert.throws(
+      () => testApi.assertAutoExitOverrideSupported("claude", true),
+      /supported only for Pi-backed subagents/,
     );
   });
 
@@ -1500,6 +1544,151 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
+  it("separates the parent-owned registration from each child's stable registry", () => {
+    const dir = createTestDir();
+    try {
+      const sessionOne = join(dir, "session-one.jsonl");
+      const first = childDescendantRegistryPath(dir, sessionOne);
+      assert.equal(
+        childDescendantRegistryPath(dir, sessionOne),
+        first,
+        "resume must reuse the child registry",
+      );
+      assert.notEqual(
+        childDescendantRegistryPath(dir, join(dir, "session-two.jsonl")),
+        first,
+        "siblings need distinct registries",
+      );
+      assert.equal(
+        parentDescendantRegistryPath("  /tmp/parent-descendants.json  "),
+        "/tmp/parent-descendants.json",
+      );
+      assert.equal(parentDescendantRegistryPath(""), undefined);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("allows a child to complete when only its parent registry contains the child itself", async () => {
+    const dir = createTestDir();
+    try {
+      const parentRegistry = join(dir, "parent-descendants.json");
+      const childRegistry = childDescendantRegistryPath(
+        dir,
+        join(dir, "child-session.jsonl"),
+      );
+      registerDescendant(parentRegistry, {
+        id: "child-self",
+        name: "Child self",
+        state: "active",
+      });
+      const previous = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+      process.env.PI_SUBAGENT_DESCENDANTS_FILE = childRegistry;
+      let shutdown = false;
+      try {
+        const { api, registeredTools } = createMockExtensionApi();
+        subagentDoneExtension(api as any);
+        const done = registeredTools.find((tool) => tool.name === "subagent_done");
+        assert.ok(done);
+        await done.execute("call-self", {}, undefined, undefined, {
+          shutdown() {
+            shutdown = true;
+          },
+        });
+        assert.equal(shutdown, true);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previous);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses completion while a tracked descendant remains", async () => {
+    const dir = createTestDir();
+    try {
+      const descendantsFile = join(dir, "descendants.json");
+      registerDescendant(descendantsFile, {
+        id: "child-1",
+        name: "Child one",
+        state: "waiting-for-terminal-delivery",
+      });
+      const previous = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+      process.env.PI_SUBAGENT_DESCENDANTS_FILE = descendantsFile;
+      try {
+        const { api, registeredTools } = createMockExtensionApi();
+        subagentDoneExtension(api as any);
+        const done = registeredTools.find((tool) => tool.name === "subagent_done");
+        assert.ok(done);
+        await assert.rejects(
+          done.execute("call-1", {}, undefined, undefined, { shutdown() {} }),
+          /tracked descendants remain: Child one \[child-1\]/,
+        );
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previous);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("defers auto-exit until tracked descendants have delivered", () => {
+    const dir = createTestDir();
+    const descendantsFile = join(dir, "descendants.json");
+    const sessionFile = join(dir, "orchestrator.jsonl");
+    registerDescendant(descendantsFile, {
+      id: "child-1",
+      name: "Child one",
+      state: "active",
+    });
+    const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+    const previousDescendants = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+    const previousSession = process.env.PI_SUBAGENT_SESSION;
+    process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+    process.env.PI_SUBAGENT_DESCENDANTS_FILE = descendantsFile;
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    try {
+      const { api, eventHandlers } = createMockExtensionApi();
+      subagentDoneExtension(api as any);
+      const agentEnd = eventHandlers.get("agent_end")?.[0];
+      const agentSettled = eventHandlers.get("agent_settled")?.[0];
+      assert.ok(agentEnd);
+      assert.ok(agentSettled);
+      let shutdowns = 0;
+      const ctx = { shutdown() { shutdowns++; } };
+      const event = { messages: [{ role: "assistant", stopReason: "stop" }] };
+
+      agentEnd(event, ctx);
+      agentSettled({ type: "agent_settled" }, ctx);
+      assert.equal(shutdowns, 0);
+      assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+      unregisterDescendant(descendantsFile, "child-1");
+      agentEnd(event, ctx);
+      assert.equal(shutdowns, 0, "agent_end must still wait for agent_settled");
+      agentSettled({ type: "agent_settled" }, ctx);
+      assert.equal(shutdowns, 1);
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+      restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previousDescendants);
+      restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the descendant registry is unreadable", () => {
+    const dir = createTestDir();
+    try {
+      const descendantsFile = join(dir, "descendants.json");
+      writeFileSync(descendantsFile, "not json");
+      assert.equal(shouldDeferAutoExitForDescendants(descendantsFile), true);
+      assert.equal(shouldDeferAutoExitForDescendants(undefined), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -2229,7 +2418,7 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers recursive extension loading parameters on subagent", () => {
+  it("registers recursive runtime and lifecycle parameters on subagent", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2240,6 +2429,11 @@ describe("tool registration", () => {
     assert.deepEqual(modeSchema.anyOf.map((entry: any) => entry.const), ["normal", "explicit"]);
     assert.equal(subagentTool.parameters.properties.extensions.type, "string");
     assert.match(subagentTool.parameters.properties.extensions.description, /effective child cwd/);
+
+    const autoExitSchema = subagentTool.parameters.properties.autoExit;
+    assert.equal(autoExitSchema.type, "boolean");
+    assert.match(autoExitSchema.description, /recursive orchestrators/);
+    assert.match(autoExitSchema.description, /Overrides agent frontmatter/);
   });
 
   it("registers subagent_resume with an autoExit override", () => {
