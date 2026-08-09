@@ -70,6 +70,11 @@ import subagentDoneExtension, {
   findLatestAssistantError,
   buildCompletionSidecar,
 } from "../pi-extension/subagents/subagent-done.ts";
+import {
+  atomicWriteJson,
+  createCompletionControlRequest,
+  readCompletionControlRequest,
+} from "../pi-extension/subagents/interrupt-control.ts";
 import { interpretExitSidecar, waitForCompletion } from "../pi-extension/subagents/completion.ts";
 import {
   createLifecycle,
@@ -1865,6 +1870,87 @@ describe("subagent-done.ts", () => {
       });
     });
   });
+
+  it("accepts an exact parent completion request and publishes a normal result", async () => {
+    const previous = {
+      id: process.env.PI_SUBAGENT_ID,
+      session: process.env.PI_SUBAGENT_SESSION,
+      activity: process.env.PI_SUBAGENT_ACTIVITY_FILE,
+      control: process.env.PI_SUBAGENT_CONTROL_FILE,
+      descendants: process.env.PI_SUBAGENT_DESCENDANTS_FILE,
+      autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+    };
+    const dir = createTestDir();
+    const sessionFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+    const activityFile = getSubagentActivityFile(dir, "child-control");
+    const controlFile = join(dir, "control", "child-control.json");
+    process.env.PI_SUBAGENT_ID = "child-control";
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+    process.env.PI_SUBAGENT_CONTROL_FILE = controlFile;
+    delete process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+    delete process.env.PI_SUBAGENT_AUTO_EXIT;
+
+    const { api, eventHandlers } = createMockExtensionApi();
+    let shutdowns = 0;
+    const ctx = {
+      ui: { setWidget() {} },
+      shutdown() {
+        shutdowns++;
+      },
+    };
+    try {
+      subagentDoneExtension(api as any);
+      for (const handler of eventHandlers.get("session_start") ?? []) handler({}, ctx);
+      for (const handler of eventHandlers.get("turn_start") ?? []) handler({ turnIndex: 4 });
+      for (const handler of eventHandlers.get("agent_end") ?? []) {
+        handler({
+          messages: [{
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "Useful final answer." }],
+          }],
+        }, ctx);
+      }
+
+      const unsettledActivity = readSubagentActivityFile(activityFile, "child-control");
+      assert.ok(unsettledActivity.ok);
+      assert.notEqual(unsettledActivity.activity.phase, "waiting", "agent_end is not safely completable");
+
+      for (const handler of eventHandlers.get("agent_settled") ?? []) {
+        handler({ type: "agent_settled" }, ctx);
+      }
+      const activity = readSubagentActivityFile(activityFile, "child-control");
+      assert.ok(activity.ok);
+      assert.equal(activity.activity.phase, "waiting");
+      const request = createCompletionControlRequest({
+        runningChildId: "child-control",
+        activity: activity.activity,
+        requestId: "parent-request",
+      });
+      atomicWriteJson(controlFile, request);
+
+      const deadline = Date.now() + 1_000;
+      while (!existsSync(`${sessionFile}.exit`) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.equal(shutdowns, 1);
+      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+        type: "done",
+        runningChildId: "child-control",
+        requestId: "parent-request",
+      });
+    } finally {
+      for (const handler of eventHandlers.get("session_shutdown") ?? []) handler({ reason: "quit" }, ctx);
+      restoreEnvVar("PI_SUBAGENT_ID", previous.id);
+      restoreEnvVar("PI_SUBAGENT_SESSION", previous.session);
+      restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", previous.activity);
+      restoreEnvVar("PI_SUBAGENT_CONTROL_FILE", previous.control);
+      restoreEnvVar("PI_SUBAGENT_DESCENDANTS_FILE", previous.descendants);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previous.autoExit);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("lifecycle.ts", () => {
@@ -2655,11 +2741,13 @@ describe("subagent activity snapshots", () => {
 
       recorder.sessionStart();
       currentNow = 3_000;
-      recorder.agentEndWaiting();
+      recorder.agentEndWaiting({ outcome: "completed", hasAssistantText: true });
       let read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "waiting");
       assert.equal(read.activity.waitingSince, 3_000);
+      assert.equal(read.activity.lastTurnOutcome, "completed");
+      assert.equal(read.activity.lastTurnHasAssistantText, true);
 
       currentNow = 4_000;
       recorder.subagentDone();
@@ -2681,6 +2769,8 @@ describe("subagent activity snapshots", () => {
         { runningChildId: 42 },
         { toolActive: "yes" },
         { toolName: "bad\nname" },
+        { lastTurnOutcome: "cancelled" },
+        { lastTurnHasAssistantText: "yes" },
       ];
 
       for (const [index, overrides] of cases.entries()) {
@@ -2787,12 +2877,16 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_interrupt in the main session extension", () => {
+  it("registers completion-aware subagent_interrupt behavior", () => {
     const { api, registeredTools } = createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
-    assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
+    const interrupt = registeredTools.find((tool) => tool.name === "subagent_interrupt");
+    assert.ok(interrupt);
+    assert.equal(interrupt.parameters.properties.finish.type, "boolean");
+    assert.match(interrupt.parameters.properties.finish.description, /turn-only Escape/);
+    assert.match(interrupt.description, /safely waiting/);
   });
 
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
@@ -2947,6 +3041,115 @@ describe("subagent interruption", () => {
     });
   });
 
+  it("completes a safely waiting child without sending Escape and is idempotent", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    withTempDir((dir) => {
+      const sessionFile = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        {
+          ...ASSISTANT_MSG,
+          message: {
+            ...ASSISTANT_MSG.message,
+            stopReason: "stop",
+            content: [{ type: "text", text: "Useful final answer." }],
+          },
+        },
+      ]);
+      const activityFile = getSubagentActivityFile(dir, "a1");
+      const controlFile = join(dir, "control", "a1.json");
+      const recorder = createSubagentActivityRecorder({ runningChildId: "a1", activityFile });
+      recorder.sessionStart();
+      recorder.turnStart(1);
+      recorder.agentEndWaiting({ outcome: "completed", hasAssistantText: true });
+      let escapes = 0;
+
+      try {
+        runningMap.set("a1", makeRunning({ sessionFile, activityFile, controlFile }));
+        const first = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+          escapes++;
+        });
+        const second = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+          escapes++;
+        });
+
+        assert.equal(escapes, 0);
+        assert.equal(first.details.status, "completion_requested");
+        assert.equal(first.details.repeated, false);
+        assert.equal(second.details.status, "completion_requested");
+        assert.equal(second.details.repeated, true);
+        assert.equal(second.details.requestId, first.details.requestId);
+        const request = readCompletionControlRequest(controlFile, "a1");
+        assert.ok(request.ok);
+        assert.equal(request.request.expectedActivitySequence, runningMap.get("a1").activity.sequence);
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
+  it("refuses to complete an aborted waiting turn with partial text", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    withTempDir((dir) => {
+      const sessionFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const activityFile = getSubagentActivityFile(dir, "a1");
+      const controlFile = join(dir, "control", "a1.json");
+      const recorder = createSubagentActivityRecorder({ runningChildId: "a1", activityFile });
+      recorder.sessionStart();
+      recorder.turnStart(1);
+      recorder.agentEndWaiting({ outcome: "aborted", hasAssistantText: true });
+      let escapes = 0;
+
+      try {
+        runningMap.set("a1", makeRunning({ sessionFile, activityFile, controlFile }));
+        const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+          escapes++;
+        });
+        assert.equal(escapes, 0);
+        assert.match(result.content[0].text, /not safely waiting/);
+        assert.equal(existsSync(controlFile), false);
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
+  it("fails closed when the child's descendant registry is unreadable", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    withTempDir((dir) => {
+      const sessionFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const activityFile = getSubagentActivityFile(dir, "a1");
+      const controlFile = join(dir, "control", "a1.json");
+      const descendantsFile = join(dir, "descendants.json");
+      writeFileSync(descendantsFile, "not json");
+      const recorder = createSubagentActivityRecorder({ runningChildId: "a1", activityFile });
+      recorder.sessionStart();
+      recorder.turnStart(1);
+      recorder.agentEndWaiting({ outcome: "completed", hasAssistantText: true });
+
+      try {
+        runningMap.set("a1", makeRunning({ sessionFile, activityFile, controlFile, childDescendantRegistryPath: descendantsFile }));
+        const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
+          throw new Error("Escape must not be sent");
+        });
+        assert.match(result.content[0].text, /descendant registry is unreadable/);
+        assert.equal(existsSync(controlFile), false);
+      } finally {
+        runningMap.clear();
+      }
+    });
+  });
+
   it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -2985,7 +3188,10 @@ describe("subagent interruption", () => {
       }));
 
       assert.equal(sentSurface, "pane-1");
-      assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
+      assert.equal(
+        result.content[0].text,
+        'Interrupt requested for subagent "Worker". The active turn is being cancelled; no result will be fabricated from an aborted turn.',
+      );
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
       const projection = projectLifecycle(runningMap.get("a1").lifecycle, 20_000);
       assert.equal(projection.kind, "interrupted");
@@ -3004,10 +3210,10 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning());
 
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      testApi.handleSubagentInterrupt({ name: "Worker", finish: false }, (surface: string) => {
         surfaces.push(surface);
       });
-      testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
+      testApi.handleSubagentInterrupt({ name: "Worker", finish: false }, (surface: string) => {
         surfaces.push(surface);
       });
 

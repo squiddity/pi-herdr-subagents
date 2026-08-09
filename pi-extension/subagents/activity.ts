@@ -40,6 +40,9 @@ export interface SubagentActivityState {
   activeSince?: number;
   waitingSince?: number;
   turnIndex?: number;
+  /** Content-free evidence for safely accepting a parent completion request. */
+  lastTurnOutcome?: "completed" | "aborted" | "error";
+  lastTurnHasAssistantText?: boolean;
   messageEventType?: string;
   toolCallId?: string;
   toolName?: string;
@@ -58,7 +61,10 @@ export interface SubagentActivityRecorder {
   input(): void;
   beforeAgentStart(): void;
   agentStart(): void;
-  agentEndWaiting(): void;
+  agentEndWaiting(evidence?: {
+    outcome: "completed" | "aborted" | "error";
+    hasAssistantText: boolean;
+  }): void;
   agentEndDone(): void;
   turnStart(turnIndex?: number): void;
   turnEnd(turnIndex?: number): void;
@@ -132,6 +138,18 @@ function validateBoolean(object: Record<string, unknown>, fieldName: string): st
   return typeof object[fieldName] === "boolean" ? null : `${fieldName} must be a boolean`;
 }
 
+function validateOptionalBoolean(object: Record<string, unknown>, fieldName: string): string | null {
+  const value = object[fieldName];
+  return value == null || typeof value === "boolean" ? null : `${fieldName} must be a boolean when present`;
+}
+
+function validateOptionalTurnOutcome(object: Record<string, unknown>): string | null {
+  const value = object.lastTurnOutcome;
+  return value == null || value === "completed" || value === "aborted" || value === "error"
+    ? null
+    : "lastTurnOutcome is invalid";
+}
+
 function validateOptionalActivityString(object: Record<string, unknown>, fieldName: string): string | null {
   const value = object[fieldName];
   if (value == null) return null;
@@ -176,6 +194,8 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalInteger(object, "turnIndex"),
     validateOptionalFiniteNumber(object, "toolStartedAt"),
     validateOptionalFiniteNumber(object, "toolEndedAt"),
+    validateOptionalTurnOutcome(object),
+    validateOptionalBoolean(object, "lastTurnHasAssistantText"),
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
@@ -243,6 +263,11 @@ function createNoopRecorder(): SubagentActivityRecorder {
     subagentDone() {},
     sessionShutdown() {},
   };
+}
+
+function clearTurnEvidence(activity: SubagentActivityState): void {
+  delete activity.lastTurnOutcome;
+  delete activity.lastTurnHasAssistantText;
 }
 
 function clearActiveState(activity: SubagentActivityState): void {
@@ -395,25 +420,36 @@ export function createSubagentActivityRecorder(params: {
       }, "immediate");
     },
     input() {
-      record("input", () => {}, "immediate");
+      record("input", (current) => {
+        clearTurnEvidence(current);
+      }, "immediate");
     },
     beforeAgentStart() {
       record("before_agent_start", (current, observedAt) => {
+        clearTurnEvidence(current);
         current.agentActive = true;
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
     agentStart() {
       record("agent_start", (current, observedAt) => {
+        clearTurnEvidence(current);
         current.agentActive = true;
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
-    agentEndWaiting() {
+    agentEndWaiting(evidence) {
       record("agent_end", (current, observedAt) => {
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;
+        if (evidence) {
+          current.lastTurnOutcome = evidence.outcome;
+          current.lastTurnHasAssistantText = evidence.hasAssistantText;
+        } else {
+          delete current.lastTurnOutcome;
+          delete current.lastTurnHasAssistantText;
+        }
       }, "immediate");
     },
     agentEndDone() {
@@ -421,6 +457,7 @@ export function createSubagentActivityRecorder(params: {
     },
     turnStart(turnIndex) {
       record("turn_start", (current, observedAt) => {
+        clearTurnEvidence(current);
         current.agentActive = true;
         current.turnActive = true;
         if (turnIndex != null) current.turnIndex = turnIndex;

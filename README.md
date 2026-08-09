@@ -264,19 +264,24 @@ subagent({ name: "Source worker", task: "Test local changes", extensionMode: "ex
 
 ---
 
-## Interrupting a running subagent
+## Completing or interrupting a running subagent
 
-Use `subagent_interrupt` to cancel the active turn of a running Pi-backed subagent:
+Use `subagent_interrupt` for a currently running Pi-backed subagent:
 
 ```typescript
+// Default: accept a safely waiting final answer and deliver it.
 subagent_interrupt({ id: "abcd1234" });
-// or
+
+// Or target an exact display name.
 subagent_interrupt({ name: "Scout" });
+
+// Always send turn-level Escape instead.
+subagent_interrupt({ id: "abcd1234", finish: false });
 ```
 
-This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately labels the child as `interrupted` (counted as **open**, not active processing). Stale pre-interrupt activity snapshots are ignored so a lagging Herdr/`active` reading cannot overwrite the interrupt. The process elapsed timer keeps running because the pane is still open; only the interrupted-state duration freezes relative to the interrupt request. If the child starts work later, newer observations return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+By default, a child that is safely waiting after a completed turn is completed through an atomic control request. The child rechecks its exact id, activity sequence, turn index, completed outcome, content-bearing final answer, and descendant registry before publishing its normal completion sidecar. The parent watcher then delivers the final answer normally.
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+Active or blocked children receive Escape and remain open. Aborted, errored, partial, stale, active, or descendant-blocked turns are not promoted into completed results. Set `finish: false` to always use explicit turn-level Escape behavior; this does not fabricate a result or forcibly terminate the session. Repeated completion requests for the same waiting generation are idempotent, while new activity invalidates stale requests.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
 

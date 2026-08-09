@@ -6,8 +6,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
-import { createSubagentActivityRecorder } from "./activity.ts";
+import { createSubagentActivityRecorder, readSubagentActivityFile } from "./activity.ts";
+import {
+  publishCompletionSidecar,
+  readCompletionControlRequest,
+  requestMatchesWaitingTurn,
+  type WaitingTurnEvidence,
+} from "./interrupt-control.ts";
 import { readTrackedDescendants } from "./descendant-registry.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -87,6 +92,27 @@ export function buildCompletionSidecar(messages: any[] | undefined):
   return errorInfo ? { type: "error", ...errorInfo } : { type: "done" };
 }
 
+export function getWaitingTurnEvidence(
+  messages: any[] | undefined,
+  turnIndex: number | undefined,
+): WaitingTurnEvidence {
+  if (!messages) return { outcome: undefined, hasAssistantText: false, turnIndex };
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "assistant") continue;
+    const hasAssistantText = Array.isArray(message.content) && message.content.some(
+      (part: any) => part?.type === "text" && typeof part.text === "string" && part.text.trim().length > 0,
+    );
+    const outcome = message.stopReason === "aborted"
+      ? "aborted" as const
+      : message.stopReason === "error"
+        ? "error" as const
+        : "completed" as const;
+    return { outcome, hasAssistantText, turnIndex };
+  }
+  return { outcome: undefined, hasAssistantText: false, turnIndex };
+}
+
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
     .split(",")
@@ -105,9 +131,13 @@ export default function (pi: ExtensionAPI) {
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const descendantsFile = process.env.PI_SUBAGENT_DESCENDANTS_FILE;
+  const runningChildId = process.env.PI_SUBAGENT_ID;
+  const activityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+  const controlFile = process.env.PI_SUBAGENT_CONTROL_FILE;
+  const sessionFile = process.env.PI_SUBAGENT_SESSION;
   const recorder = createSubagentActivityRecorder({
-    runningChildId: process.env.PI_SUBAGENT_ID,
-    activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
+    runningChildId,
+    activityFile,
   });
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
@@ -164,6 +194,54 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   let latestAgentMessages: any[] | undefined;
+  let currentTurnIndex: number | undefined;
+  let waitingEvidence: WaitingTurnEvidence = {
+    outcome: undefined,
+    hasAssistantText: false,
+    turnIndex: undefined,
+  };
+  let controlInterval: ReturnType<typeof setInterval> | null = null;
+  let completionAccepted = false;
+
+  function descendantsAllowCompletion(): boolean {
+    if (!descendantsFile) return true;
+    try {
+      return readTrackedDescendants(descendantsFile).length === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  function pollCompletionControl(ctx: { shutdown(): void }): void {
+    if (
+      completionAccepted ||
+      !controlFile ||
+      !sessionFile ||
+      !runningChildId ||
+      !activityFile
+    ) return;
+
+    const control = readCompletionControlRequest(controlFile, runningChildId);
+    if (!control.ok) return;
+    const activity = readSubagentActivityFile(activityFile, runningChildId);
+    if (!activity.ok) return;
+    if (!requestMatchesWaitingTurn(control.request, activity.activity, waitingEvidence)) return;
+    if (!descendantsAllowCompletion()) return;
+
+    completionAccepted = true;
+    try {
+      publishCompletionSidecar(sessionFile, {
+        type: "done",
+        runningChildId,
+        requestId: control.request.requestId,
+      });
+    } catch {
+      completionAccepted = false;
+      return;
+    }
+    recorder.subagentDone();
+    ctx.shutdown();
+  }
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -173,9 +251,13 @@ export default function (pi: ExtensionAPI) {
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
+    if (controlFile && !controlInterval) {
+      controlInterval = setInterval(() => pollCompletionControl(ctx), 100);
+    }
   });
 
   pi.on("input", () => {
+    waitingEvidence = { outcome: undefined, hasAssistantText: false, turnIndex: currentTurnIndex };
     recorder.input();
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
@@ -184,6 +266,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", () => {
+    waitingEvidence = { outcome: undefined, hasAssistantText: false, turnIndex: currentTurnIndex };
     recorder.beforeAgentStart();
   });
 
@@ -194,10 +277,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event) => {
     // agent_end is not terminal: Pi may compact and automatically retry after
-    // this event. Keep the latest result, but do not publish completion or
-    // shut down until agent_settled confirms no continuation will run.
+    // this event. Keep the latest result and waiting evidence, but do not
+    // publish completion or shut down until agent_settled confirms no
+    // continuation will run.
     latestAgentMessages = (event as any).messages as any[] | undefined;
-    recorder.agentEndWaiting();
+    waitingEvidence = getWaitingTurnEvidence(latestAgentMessages, currentTurnIndex);
   });
 
   pi.on("agent_settled", (_event, ctx) => {
@@ -209,13 +293,14 @@ export default function (pi: ExtensionAPI) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      // Without this the parent would only see exit code 0 and a stale
+      // assistant message, mistaking the crash for a successful completion.
       if (sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify(buildCompletionSidecar(latestAgentMessages)),
-          );
+          publishCompletionSidecar(sessionFile, {
+            ...buildCompletionSidecar(latestAgentMessages),
+            ...(runningChildId ? { runningChildId } : {}),
+          });
         } catch {
           // Best effort — the watcher can still detect the terminal sentinel
           // after shutdown if the completion sidecar cannot be written.
@@ -227,6 +312,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Only settled output is eligible for parent-driven completion or waiting
+    // timeout notifications. agent_end may still be followed by automatic
+    // compaction or retry.
+    recorder.agentEndWaiting({
+      outcome: waitingEvidence.outcome ?? "error",
+      hasAssistantText: waitingEvidence.hasAssistantText,
+    });
+
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest settled agent run completed normally, not by who initiated it.
@@ -235,11 +328,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_start", (event) => {
-    recorder.turnStart((event as any).turnIndex);
+    currentTurnIndex = (event as any).turnIndex;
+    waitingEvidence = { outcome: undefined, hasAssistantText: false, turnIndex: currentTurnIndex };
+    recorder.turnStart(currentTurnIndex);
   });
 
   pi.on("turn_end", (event) => {
-    recorder.turnEnd((event as any).turnIndex);
+    currentTurnIndex = (event as any).turnIndex;
+    recorder.turnEnd(currentTurnIndex);
   });
 
   pi.on("before_provider_request", () => {
@@ -275,6 +371,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    if (controlInterval) {
+      clearInterval(controlInterval);
+      controlInterval = null;
+    }
     recorder.sessionShutdown((event as any).reason);
   });
 
@@ -312,7 +412,10 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      publishCompletionSidecar(sessionFile, {
+        ...exitData,
+        ...(runningChildId ? { runningChildId } : {}),
+      });
 
       ctx.shutdown();
       return {
@@ -343,7 +446,10 @@ export default function (pi: ExtensionAPI) {
       }
       recorder.subagentDone();
       if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        publishCompletionSidecar(sessionFile, {
+          type: "done",
+          ...(runningChildId ? { runningChildId } : {}),
+        });
       }
       ctx.shutdown();
       return {
