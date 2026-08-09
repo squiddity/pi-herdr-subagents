@@ -295,6 +295,10 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 
+Tracked `subagent_resume` requires the session's adjacent `<session>.profile.json` launch profile. New Pi-backed children write this bounded, unsigned local manifest so resume restores the original model, thinking level, cwd, named identity, tool policy, extension runtime, config root, and child-profile policy. Missing, malformed, symlinked, special, or oversized profiles are refused before pane creation. This is a policy-preservation mechanism, not a signature, provenance, or tamper-resistance claim.
+
+External, manually created, or older sessions can still be resumed directly with `pi --session <path>`, but they do not receive tracked policy-preserving `subagent_resume` behavior.
+
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)

@@ -1,6 +1,15 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -458,6 +467,24 @@ describe("session.ts", () => {
   });
 
   describe("seedSubagentSessionFile", () => {
+    it("creates a standalone session with no parent linkage", () => {
+      const childFile = join(dir, "standalone-child.jsonl");
+
+      seedSubagentSessionFile({
+        mode: "standalone",
+        childSessionFile: childFile,
+        childCwd: "/tmp/standalone-child-cwd",
+      });
+
+      const lines = readFileSync(childFile, "utf8").trim().split("\n");
+      assert.equal(lines.length, 1);
+
+      const header = JSON.parse(lines[0]);
+      assert.equal(header.type, "session");
+      assert.equal(header.cwd, "/tmp/standalone-child-cwd");
+      assert.equal("parentSession" in header, false);
+    });
+
     it("creates a lineage-only child session with parent linkage and no copied turns", () => {
       const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
       const childFile = join(dir, "lineage-child.jsonl");
@@ -2436,7 +2463,7 @@ describe("tool registration", () => {
     assert.match(autoExitSchema.description, /Overrides agent frontmatter/);
   });
 
-  it("registers subagent_resume with an autoExit override", () => {
+  it("registers subagent_resume with an autoExit override and profile guidance", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2446,6 +2473,69 @@ describe("tool registration", () => {
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
+    assert.match(resumeTool.description, /launch profile/);
+    assert.match(resumeTool.description, /pi --session/);
+  });
+
+  it("canonicalizes relative resume paths before profile-controlled cwd changes", () => {
+    withTempDir((dir) => {
+      const previousCwd = process.cwd();
+      try {
+        process.chdir(dir);
+        const resolved = (subagentsModule as any).__test__.resolveResumeSessionPath("sessions/child.jsonl");
+        assert.equal(resolved, join(dir, "sessions", "child.jsonl"));
+      } finally {
+        process.chdir(previousCwd);
+      }
+    });
+  });
+
+  it("rejects unsafe resume session paths before terminal creation", async () => {
+    const dir = createTestDir();
+    try {
+      const target = createSessionFile(dir, []);
+      const symlinkPath = join(dir, "linked-session.jsonl");
+      symlinkSync(target, symlinkPath);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+
+      let result = await resumeTool.execute("call", { sessionPath: symlinkPath }, undefined, undefined, {});
+      assert.equal(result.details.error, "unsafe session path");
+      assert.match(result.content[0].text, /symbolic link/);
+
+      const fifoPath = join(dir, "fifo-session.jsonl");
+      execFileSync("mkfifo", [fifoPath]);
+      result = await resumeTool.execute("call", { sessionPath: fifoPath }, undefined, undefined, {});
+      assert.equal(result.details.error, "unsafe session path");
+      assert.match(result.content[0].text, /regular file/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("requires a valid launch profile before creating a resume pane", async () => {
+    const dir = createTestDir();
+    try {
+      const sessionPath = createSessionFile(dir, []);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+
+      let result = await resumeTool.execute("call", { sessionPath }, undefined, undefined, {});
+      assert.equal(result.details.error, "launch profile missing");
+      assert.equal(result.details.profileStatus, "absent");
+      assert.match(result.content[0].text, /Only sessions created with profile preservation are supported/);
+      assert.match(result.content[0].text, /pi --session/);
+
+      writeFileSync(`${sessionPath}.profile.json`, JSON.stringify({ version: 1, task: "must not load" }));
+      result = await resumeTool.execute("call", { sessionPath }, undefined, undefined, {});
+      assert.equal(result.details.error, "invalid launch profile");
+      assert.equal(result.details.profileStatus, "malformed");
+      assert.match(result.content[0].text, /Refusing to resume/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
